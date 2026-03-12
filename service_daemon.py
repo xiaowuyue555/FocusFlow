@@ -10,7 +10,7 @@ def run_daemon():
     init_db()  # 初始化数据库和表
     
     idle_threshold = int(os.getenv("FOCUSFLOW_IDLE_SECONDS", "30"))
-    interval = int(os.getenv("FOCUSFLOW_INTERVAL_SECONDS", "5"))
+    interval = int(os.getenv("FOCUSFLOW_INTERVAL_SECONDS", "1"))
     debug_idle = os.getenv("FOCUSFLOW_DEBUG", "0") == "1"
     idle_source = os.getenv("FOCUSFLOW_IDLE_SOURCE", "combined").lower()
     idle_mode = os.getenv("FOCUSFLOW_IDLE_MODE", "strict").lower()
