@@ -1,7 +1,7 @@
 import time
 import datetime
 import os
-import Quartz
+import platform
 from core.database import init_db, get_connection
 from modules.app_detector import get_active_app_info
 
@@ -14,11 +14,15 @@ def run_daemon():
     idle_source = os.getenv("FOCUSFLOW_IDLE_SOURCE", "combined").lower()
     idle_mode = os.getenv("FOCUSFLOW_IDLE_MODE", "strict").lower()
     
-    if idle_source == "hid":
-        idle_state = Quartz.kCGEventSourceStateHIDSystemState
-    else:
-        idle_state = getattr(Quartz, "kCGEventSourceStateCombinedSessionState", Quartz.kCGEventSourceStateHIDSystemState)
-    
+    os_name = platform.system()
+    idle_state = None
+    if os_name == "Darwin":
+        import Quartz
+        if idle_source == "hid":
+            idle_state = Quartz.kCGEventSourceStateHIDSystemState
+        else:
+            idle_state = getattr(Quartz, "kCGEventSourceStateCombinedSessionState", Quartz.kCGEventSourceStateHIDSystemState)
+            
     last_app = "--"
     last_file = "--"
 
@@ -33,25 +37,25 @@ def run_daemon():
                 idle_threshold = int(row[0]) if row else 30
             
             # 3. 检测系统是否闲置
-            if idle_mode == "strict":
-                # 严格模式：只计算键盘敲击、鼠标点击和滚轮，忽略纯粹的鼠标悬停移动
-                event_types = [
-                    Quartz.kCGEventKeyDown,
-                    Quartz.kCGEventLeftMouseDown,
-                    Quartz.kCGEventRightMouseDown,
-                    Quartz.kCGEventOtherMouseDown,
-                    Quartz.kCGEventScrollWheel,
-                ]
-                idle_times = [
-                    Quartz.CGEventSourceSecondsSinceLastEventType(idle_state, et)
-                    for et in event_types
-                ]
-                idle_time = min([t for t in idle_times if t is not None], default=None)
-            else:
-                idle_time = Quartz.CGEventSourceSecondsSinceLastEventType(
-                    idle_state,
-                    Quartz.kCGAnyInputEventType
-                )
+            # 3. 检测系统是否闲置
+            idle_time = 0
+            if os_name == "Darwin":
+                import Quartz
+                if idle_mode == "strict":
+                    event_types = [
+                        Quartz.kCGEventKeyDown, Quartz.kCGEventLeftMouseDown,
+                        Quartz.kCGEventRightMouseDown, Quartz.kCGEventOtherMouseDown,
+                        Quartz.kCGEventScrollWheel,
+                    ]
+                    idle_times = [Quartz.CGEventSourceSecondsSinceLastEventType(idle_state, et) for et in event_types]
+                    idle_time = min([t for t in idle_times if t is not None], default=None)
+                else:
+                    idle_time = Quartz.CGEventSourceSecondsSinceLastEventType(idle_state, Quartz.kCGAnyInputEventType)
+            elif os_name == "Windows":
+                import win32api
+                last_input = win32api.GetLastInputInfo()
+                current_time = win32api.GetTickCount()
+                idle_time = (current_time - last_input) / 1000.0
             if debug_idle:
                 print(f"🕒 空闲秒数: {idle_time} (阈值: {idle_threshold})")
             

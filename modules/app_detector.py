@@ -1,61 +1,72 @@
-import Quartz
+import platform
 
 def get_active_app_info():
+    os_name = platform.system()
+    if os_name == "Darwin":
+        return _get_active_app_mac()
+    elif os_name == "Windows":
+        return _get_active_app_windows()
+    return "Unknown", "N/A"
+
+def _get_active_app_mac():
+    import Quartz
     try:
-        # 直接让显卡交出当前屏幕上所有窗口的列表（默认按从前到后的层级排序）
         window_list = Quartz.CGWindowListCopyWindowInfo(
             Quartz.kCGWindowListOptionOnScreenOnly | Quartz.kCGWindowListExcludeDesktopElements, 
             Quartz.kCGNullWindowID
         )
-        
         for win in window_list:
             owner = win.get("kCGWindowOwnerName", "")
             title = win.get("kCGWindowName", "")
             layer = win.get("kCGWindowLayer", 0)
             alpha = win.get("kCGWindowAlpha", 1)
             
-            # 【新增】：系统级噪音黑名单
-            system_noise = [
-                "WindowManager", "Dock", "Window Server", 
-                "ControlCenter", "NotificationCenter", "loginwindow"
-            ]
+            system_noise = ["WindowManager", "Dock", "Window Server", "ControlCenter", "NotificationCenter", "loginwindow"]
             
-            # layer == 0 是普通主窗口。由于列表是从前到后排的，
             if owner and layer == 0 and alpha > 0:
-                # 过滤掉系统自带的桌面管理和菜单栏噪音
-                if owner in system_noise:
-                    continue  # 跳过这个，去抓下面那一层真正的软件！
-                    
-                
+                if owner in system_noise: continue
                 app_name = owner
-                
-                # 默认路径名：如果抓不到标题，就用 [软件名] 代替
                 file_path = f"[{app_name}]"
-                
                 if title:
-                    # 针对 AE / PR 的提取逻辑
                     if ("After Effects" in owner) or ("Premiere" in owner):
                         if ".aep" in title.lower() or ".prproj" in title.lower():
-                            if " - " in title:
-                                file_path = title.split(" - ", 1)[-1].replace("*", "").strip()
-                            else:
-                                file_path = title.replace("*", "").strip()
-                                
-                    # 针对 Photoshop 的提取逻辑
+                            file_path = title.split(" - ", 1)[-1].replace("*", "").strip() if " - " in title else title.replace("*", "").strip()
                     elif "Photoshop" in owner:
                         if ".psd" in title.lower() or ".psb" in title.lower():
-                            if " @ " in title:
-                                file_path = title.split(" @ ")[0].replace("*", "").strip()
-                            else:
-                                file_path = title.replace("*", "").strip()
-                                
-                    # 其他所有普通软件 (如 Chrome, Word 等)，直接拿窗口标题当路径
+                            file_path = title.split(" @ ")[0].replace("*", "").strip() if " @ " in title else title.replace("*", "").strip()
                     else:
                         file_path = title.strip()
-                        
                 return app_name, file_path
-                
         return "Unknown", "N/A"
-    except Exception as e:
-        print(f"获取窗口错误: {e}")
+    except:
+        return "Unknown", "N/A"
+
+def _get_active_app_windows():
+    try:
+        import win32gui
+        import win32process
+        import psutil
+        
+        hwnd = win32gui.GetForegroundWindow()
+        if not hwnd: return "Unknown", "N/A"
+        
+        title = win32gui.GetWindowText(hwnd)
+        _, pid = win32process.GetWindowThreadProcessId(hwnd)
+        app_name = psutil.Process(pid).name().replace(".exe", "")
+        
+        system_noise = ["SearchHost", "ShellExperienceHost", "explorer"]
+        if app_name in system_noise: return "Unknown", "N/A"
+        
+        file_path = f"[{app_name}]"
+        if title:
+            if "After Effects" in app_name or "Premiere" in app_name:
+                if ".aep" in title.lower() or ".prproj" in title.lower():
+                    file_path = title.split(" - ", 1)[-1].replace("*", "").strip() if " - " in title else title.replace("*", "").strip()
+            elif "Photoshop" in app_name:
+                if ".psd" in title.lower() or ".psb" in title.lower():
+                    file_path = title.split(" @ ")[0].replace("*", "").strip() if " @ " in title else title.replace("*", "").strip()
+            else:
+                file_path = title.strip()
+        return app_name, file_path
+    except:
         return "Unknown", "N/A"
