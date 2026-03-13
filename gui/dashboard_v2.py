@@ -1,7 +1,8 @@
 import sys
 import os
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
+import pandas as pd
 
 # 确保能导入 core 模块
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -256,9 +257,15 @@ class DashboardV2(QMainWindow):
         self.btn_db = QPushButton("🗄️ 数据库")
         self.btn_db.clicked.connect(self.open_database_manager)
         
+        # 【新增】：批量导出结算大单按钮
+        self.btn_export_all = QPushButton("💰 导出全盘月度总结算单")
+        self.btn_export_all.setStyleSheet("background-color: #2E8B57; color: white; font-weight: bold; padding: 6px 16px; border-radius: 4px;")
+        self.btn_export_all.clicked.connect(self.action_export_all_bills)
+        
         self.btn_settings = QPushButton("⚙ 设置")
         self.btn_settings.clicked.connect(self.open_settings)
         
+        header_layout.addWidget(self.btn_export_all)
         header_layout.addWidget(self.btn_db)
         header_layout.addWidget(self.btn_blacklist)
         header_layout.addWidget(self.btn_settings)
@@ -696,7 +703,7 @@ class DashboardV2(QMainWindow):
         menu = QMenu(self)
         if not index.isValid():
             menu.addAction("➕ 新建根项目").triggered.connect(lambda: self.action_new_project(None))
-            menu.exec_(self.tree_projects.viewport().mapToGlobal(pos))
+            menu.exec(self.tree_projects.viewport().mapToGlobal(pos))
             return
 
         item_node = self.model_projects.itemFromIndex(index.siblingAtColumn(0))
@@ -711,6 +718,13 @@ class DashboardV2(QMainWindow):
             menu.addAction("➕ 新建子项目").triggered.connect(lambda: self.action_new_project(project_id))
             menu.addAction("✏️ 重命名").triggered.connect(lambda: self.action_rename_project(project_id, name_pure))
             menu.addAction("🤖 编辑自动匹配规则...").triggered.connect(lambda: ProjectRulesDialog(project_id, name_pure, self).exec())
+            
+            # 【新增】：导出 Excel 账单
+            menu.addSeparator()
+            action_export = menu.addAction("🧾 导出工时账单 (Excel)...")
+            # 使用带图标和特殊颜色的样式，让它更醒目
+            action_export.triggered.connect(lambda: self.action_export_bill(project_id, name_pure))
+            
             menu.addSeparator()
             if is_archived:
                 menu.addAction("🔄 取消归档 (恢复)").triggered.connect(lambda: self.action_restore_project(project_id))
@@ -731,7 +745,7 @@ class DashboardV2(QMainWindow):
         menu.addAction("➡️ 手动分配到项目...").triggered.connect(lambda: self.action_assign_item(f_path))
         menu.addSeparator()
         menu.addAction("🚫 永久忽略 (加黑名单)").triggered.connect(lambda: self.action_ignore_item(a_name))
-        menu.exec_(self.tree_inbox.viewport().mapToGlobal(pos))
+        menu.exec(self.tree_inbox.viewport().mapToGlobal(pos))
 
     # --- 动作实现 (保持不变) ---
     def action_new_project(self, parent_id):
@@ -760,6 +774,178 @@ class DashboardV2(QMainWindow):
         if QMessageBox.question(self, "确认删除", "确定要删除该项目吗？绑定的文件将被退回Inbox。") == QMessageBox.Yes:
             if delete_project(project_id, delete_children=False): self.refresh_data()
             else: QMessageBox.warning(self, "删除失败", "请先删除它包含的子项目！")
+    def action_export_bill(self, project_id, project_name):
+        default_name = f"{project_name}_工时明细_{datetime.now().strftime('%Y%m%d')}.xlsx"
+        file_path, _ = QFileDialog.getSaveFileName(self, "导出单项目账单", default_name, "Excel Files (*.xlsx)")
+        if not file_path: return
+
+        try:
+            conn = get_connection()
+            tree = load_project_tree()
+            node = tree.get_node(project_id)
+            if not node: return
+            
+            # 建立：{project_id: "它的完整路径名称"} 的映射表
+            pid_to_path = {}
+            def build_paths(n, current_path):
+                path = f"{current_path} / {n.name}" if current_path else n.name
+                pid_to_path[n.id] = path
+                for c in n.get_children(): build_paths(c, path)
+            build_paths(node, "")
+            
+            all_pids = list(pid_to_path.keys())
+            placeholders = ','.join('?' * len(all_pids))
+            
+            query = f"""
+                SELECT 
+                    DATE(al.timestamp, 'localtime') as work_date,
+                    fa.project_id,
+                    al.app_name,
+                    al.file_path,
+                    al.duration
+                FROM activity_log al
+                JOIN file_assignment fa ON al.file_path = fa.file_path
+                WHERE fa.project_id IN ({placeholders})
+            """
+            import pandas as pd
+            df = pd.read_sql_query(query, conn, params=all_pids)
+            conn.close()
+
+            if df.empty:
+                return QMessageBox.warning(self, "提示", "该项目目前没有任何工时记录。")
+
+            # 【新增：给每一行贴上它属于哪个子项目】
+            df['所属项目'] = df['project_id'].map(pid_to_path)
+            
+            df_grouped = df.groupby(['work_date', '所属项目', 'app_name', 'file_path'])['duration'].sum().reset_index()
+            
+            def format_dur(secs):
+                secs = int(secs)
+                return f"{secs//3600}小时 {(secs%3600)//60}分钟" if secs>=3600 else f"{secs//60}分钟"
+                
+            df_grouped['持续时间'] = df_grouped['duration'].apply(format_dur)
+            
+            # 调整列的顺序，把“所属项目”放在第二列
+            df_final = df_grouped[['work_date', '所属项目', 'app_name', 'file_path', '持续时间']]
+            df_final.columns = ['工作日期', '项目/制作阶段', '使用软件', '操作文件 / 窗口', '累计时长']
+            df_final = df_final.sort_values(by=['工作日期', '项目/制作阶段'], ascending=[False, True])
+
+            with pd.ExcelWriter(file_path, engine='openpyxl') as writer:
+                # 写入明细
+                df_final.to_excel(writer, sheet_name='工时明细', index=False)
+                
+                # 写入总览
+                total_seconds = df['duration'].sum()
+                pd.DataFrame({
+                    '项目名称': [project_name],
+                    '导出时间': [datetime.now().strftime('%Y-%m-%d %H:%M')],
+                    '总计投入工时': [format_dur(total_seconds)],
+                    '总计秒数 (供计算)': [int(total_seconds)]
+                }).to_excel(writer, sheet_name='项目总览', index=False)
+                
+                # 美化列宽
+                worksheet = writer.sheets['工时明细']
+                for col, width in zip(['A','B','C','D','E'], [15, 25, 20, 50, 15]):
+                    worksheet.column_dimensions[col].width = width
+
+            QMessageBox.information(self, "导出成功", f"包含子项目层级的账单已生成！\n\n共 {len(df_final)} 条日结明细记录。")
+
+        except Exception as e:
+            QMessageBox.critical(self, "导出失败", f"生成 Excel 时发生错误：\n{str(e)}")
+
+    def action_export_all_bills(self):
+        file_path, _ = QFileDialog.getSaveFileName(self, "导出全局总结算单", f"FocusFlow_全局账单_{datetime.now().strftime('%Y%m')}.xlsx", "Excel Files (*.xlsx)")
+        if not file_path: return
+
+        try:
+            conn = get_connection()
+            # 获取所有未归档的根项目
+            tree = load_project_tree()
+            root_nodes = [n for n in tree.get_root_nodes() if not n.is_archived]
+            
+            if not root_nodes:
+                return QMessageBox.warning(self, "提示", "目前没有活跃的根项目可导出。")
+
+            import pandas as pd
+            with pd.ExcelWriter(file_path, engine='openpyxl') as writer:
+                # 第一页：全局大盘汇总
+                global_summary = []
+                
+                # 遍历每一个根项目，把它生成一个独立的 Sheet
+                for root in root_nodes:
+                    pid_to_path = {}
+                    def build_paths(n, current_path):
+                        path = f"{current_path} / {n.name}" if current_path else n.name
+                        pid_to_path[n.id] = path
+                        for c in n.get_children(): build_paths(c, path)
+                    build_paths(root, "")
+                    
+                    all_pids = list(pid_to_path.keys())
+                    placeholders = ','.join('?' * len(all_pids))
+                    
+                    query = f"""
+                        SELECT DATE(al.timestamp, 'localtime') as work_date, fa.project_id, al.app_name, al.file_path, al.duration
+                        FROM activity_log al JOIN file_assignment fa ON al.file_path = fa.file_path
+                        WHERE fa.project_id IN ({placeholders})
+                    """
+                    df = pd.read_sql_query(query, conn, params=all_pids)
+                    
+                    if df.empty: continue # 这个项目没动静就跳过
+                    
+                    # 生成该项目的明细 Sheet
+                    df['所属阶段'] = df['project_id'].map(pid_to_path)
+                    df_grouped = df.groupby(['work_date', '所属阶段', 'app_name', 'file_path'])['duration'].sum().reset_index()
+                    
+                    def format_dur(secs):
+                        secs = int(secs)
+                        return f"{secs//3600}小时 {(secs%3600)//60}分钟" if secs>=3600 else f"{secs//60}分钟"
+                        
+                    df_grouped['持续时间'] = df_grouped['duration'].apply(format_dur)
+                    
+                    df_final = df_grouped[['work_date', '所属阶段', 'app_name', 'file_path', '持续时间']]
+                    df_final.columns = ['日期', '制作阶段', '软件', '文件', '耗时']
+                    df_final = df_final.sort_values(by=['日期', '制作阶段'], ascending=[False, True])
+                    
+                    # 为了防止 Sheet 名字过长报错，截取前 25 个字符
+                    sheet_name = str(root.name)[:25]
+                    df_final.to_excel(writer, sheet_name=sheet_name, index=False)
+                    
+                    # 调整该 Sheet 的列宽
+                    worksheet = writer.sheets[sheet_name]
+                    for col, width in zip(['A','B','C','D','E'], [15, 20, 20, 50, 15]):
+                        worksheet.column_dimensions[col].width = width
+                    
+                    # 把这个项目的总和存入全局大盘
+                    total_seconds = df['duration'].sum()
+                    global_summary.append({
+                        '项目名称': root.name,
+                        '本月/总投入工时': format_dur(total_seconds),
+                        '折合小时数': round(total_seconds / 3600, 2)
+                    })
+                
+                # 最后，把全局大盘生成并放在最前面
+                if global_summary:
+                    df_summary = pd.DataFrame(global_summary)
+                    # 添加一行“总计”
+                    total_all = sum([float(item['折合小时数']) for item in global_summary])
+                    df_summary.loc[len(df_summary)] = ['【所有项目总计】', '--', total_all]
+                    
+                    df_summary.to_excel(writer, sheet_name='全局财务大盘', index=False)
+                    writer.sheets['全局财务大盘'].column_dimensions['A'].width = 30
+                    writer.sheets['全局财务大盘'].column_dimensions['B'].width = 25
+                    writer.sheets['全局财务大盘'].column_dimensions['C'].width = 15
+                    
+                    # 将全局大盘移到第一个 Tab
+                    sheets = writer.book._sheets
+                    summary_sheet = sheets.pop(-1)
+                    sheets.insert(0, summary_sheet)
+
+            conn.close()
+            QMessageBox.information(self, "导出成功", f"包含所有项目的月度总结算单已生成！\n\n已为您自动整理了各项目独立分页及全局财务大盘。")
+
+        except Exception as e:
+            QMessageBox.critical(self, "导出失败", f"生成 Excel 时发生错误：\n{str(e)}")
+
     def action_assign_item(self, file_path):
         projects = [p for p in get_all_projects_flat() if not p['is_archived']]
         if not projects: return QMessageBox.warning(self, "提示", "请先在左侧新建一个项目！")
