@@ -1,3 +1,12 @@
+# 【新增】：导入 matplotlib 及其与 PySide6 的连接器
+import matplotlib
+matplotlib.use('QtAgg')  # 告诉 matplotlib 使用 Qt 引擎渲染
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
+import matplotlib.pyplot as plt
+import pandas as pd
+from datetime import datetime, timedelta
+
 import sys
 import os
 import sqlite3
@@ -204,7 +213,158 @@ class SettingsDialog(QDialog):
             conn.close()
             self.accept()
 
+
+
 # ================= 极客时间轴组件 =================
+# ================= 数据可视化大屏 =================
+
+class DataDashboardWindow(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("📊 生产力数据大屏 (本周洞察)")
+        self.resize(1000, 600)  # 给图表足够的空间
+        self.setMinimumSize(800, 500)
+        
+        # 强制 Matplotlib 使用 Mac 系统自带的中文字体（防止中文变成小方块）
+        import platform
+        if platform.system() == "Darwin":
+            plt.rcParams['font.sans-serif'] = ['Arial Unicode MS', 'PingFang SC', 'Heiti SC']
+        elif platform.system() == "Windows":
+            plt.rcParams['font.sans-serif'] = ['Microsoft YaHei']
+        plt.rcParams['axes.unicode_minus'] = False # 正常显示负号
+        
+        # 采用深色酷炫主题
+        plt.style.use('dark_background')
+        
+        self.setup_ui()
+        self.load_and_draw_data()
+
+    def setup_ui(self):
+        layout = QVBoxLayout(self)
+        
+        # 顶部标题栏
+        header = QLabel("FocusFlow / 过去 7 天生产力洞察")
+        header.setStyleSheet("color: #9CDCFE; font-size: 18px; font-weight: bold; padding: 10px;")
+        header.setAlignment(Qt.AlignCenter)
+        layout.addWidget(header)
+        
+        # 图表容器（左右分栏）
+        chart_layout = QHBoxLayout()
+        
+        # 创建两个独立的 Figure 画布
+        self.fig_bar = Figure(figsize=(6, 4), dpi=100)
+        self.canvas_bar = FigureCanvas(self.fig_bar)
+        self.fig_pie = Figure(figsize=(4, 4), dpi=100)
+        self.canvas_pie = FigureCanvas(self.fig_pie)
+        
+        chart_layout.addWidget(self.canvas_bar, stretch=3) # 柱状图占 3 份宽
+        chart_layout.addWidget(self.canvas_pie, stretch=2) # 饼图占 2 份宽
+        
+        layout.addLayout(chart_layout)
+        
+        # 底部关闭按钮
+        btn_close = QPushButton("关闭大屏")
+        btn_close.setFixedWidth(150)
+        btn_close.clicked.connect(self.accept)
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        btn_layout.addWidget(btn_close)
+        btn_layout.addStretch()
+        layout.addLayout(btn_layout)
+
+    def load_and_draw_data(self):
+        conn = get_connection()
+        
+        # 1. 获取过去 7 天的日期范围
+        today = datetime.now()
+        start_date = (today - timedelta(days=6)).strftime('%Y-%m-%d')
+        
+        # --- 图表 1：过去 7 天每日趋势 (柱状图) ---
+        query_trend = """
+            SELECT DATE(SUBSTR(timestamp, 1, 10)) as work_date, SUM(duration)/3600.0 as hours
+            FROM activity_log
+            WHERE DATE(SUBSTR(timestamp, 1, 10)) >= ?
+            GROUP BY work_date
+            ORDER BY work_date ASC
+        """
+        df_trend = pd.read_sql_query(query_trend, conn, params=(start_date,))
+        
+        # 补全可能缺失的日期（某天没干活也要显示 0）
+        date_list = [(today - timedelta(days=i)).strftime('%Y-%m-%d') for i in range(6, -1, -1)]
+        df_trend.set_index('work_date', inplace=True)
+        df_trend = df_trend.reindex(date_list, fill_value=0.0).reset_index()
+        # 把日期简化为 'MM-DD'，X轴更好看
+        df_trend['work_date'] = df_trend['work_date'].apply(lambda x: x[5:])
+        
+        # 开始画柱状图
+        ax_bar = self.fig_bar.add_subplot(111)
+        ax_bar.clear()
+        # 使用极客感的青蓝色
+        bars = ax_bar.bar(df_trend['work_date'], df_trend['hours'], color='#0E639C', alpha=0.8, width=0.5)
+        ax_bar.set_title("每日总工作时长 (小时)", fontsize=14, color='#CCCCCC', pad=15)
+        ax_bar.set_ylabel("小时 (h)", color='#888888')
+        ax_bar.grid(axis='y', linestyle='--', alpha=0.3)
+        ax_bar.spines['top'].set_visible(False)
+        ax_bar.spines['right'].set_visible(False)
+        ax_bar.spines['left'].set_color('#555555')
+        ax_bar.spines['bottom'].set_color('#555555')
+        ax_bar.tick_params(colors='#AAAAAA')
+        
+        # 在柱子顶端标上数字
+        for bar in bars:
+            yval = bar.get_height()
+            if yval > 0:
+                ax_bar.text(bar.get_x() + bar.get_width()/2, yval + 0.1, round(yval, 1), ha='center', va='bottom', color='#FFFFFF', fontsize=10)
+
+        # --- 图表 2：过去 7 天各项目时间占比 (环形饼图) ---
+        query_pie = """
+            SELECT p.project_name, SUM(al.duration) as total_secs
+            FROM activity_log al
+            JOIN file_assignment fa ON al.file_path = fa.file_path
+            JOIN projects p ON fa.project_id = p.id
+            WHERE DATE(SUBSTR(al.timestamp, 1, 10)) >= ?
+            GROUP BY p.project_name
+            ORDER BY total_secs DESC
+        """
+        df_pie = pd.read_sql_query(query_pie, conn, params=(start_date,))
+        conn.close()
+        
+        ax_pie = self.fig_pie.add_subplot(111)
+        ax_pie.clear()
+        
+        if not df_pie.empty and df_pie['total_secs'].sum() > 0:
+            # 配色方案（取自你界面的主题色）
+            colors = ['#0E639C', '#31A8FF', '#EA77FF', '#FF9A00', '#E87D0D', '#00B4AB']
+            # 画一个空心圆环图 (Donut Chart)，比实心饼图看起来更高级
+            wedges, texts, autotexts = ax_pie.pie(
+                df_pie['total_secs'], 
+                labels=df_pie['project_name'], 
+                autopct='%1.1f%%', 
+                startangle=90, 
+                colors=colors,
+                wedgeprops=dict(width=0.4, edgecolor='#1E1E1E') # width控制空心粗细，edgecolor描边防粘连
+            )
+            ax_pie.set_title("本周项目时间精力分配", fontsize=14, color='#CCCCCC', pad=15)
+            
+            # 美化文字颜色
+            for text in texts: text.set_color('#AAAAAA')
+            for autotext in autotexts: 
+                autotext.set_color('#FFFFFF')
+                autotext.set_fontsize(10)
+                autotext.set_weight('bold')
+        else:
+            # 如果这周啥也没干，画个空心灰圈
+            ax_pie.pie([1], labels=["暂无数据"], colors=['#333333'], wedgeprops=dict(width=0.4))
+            ax_pie.set_title("本周项目精力分配", fontsize=14, color='#555555')
+            
+        self.fig_bar.tight_layout()
+        self.fig_pie.tight_layout()
+        
+        # 刷新画布显示
+        self.canvas_bar.draw()
+        self.canvas_pie.draw()
+
+
 # ================= 极客交互式时间轴组件 (可缩放/拖拽) =================
 
 class TimelineWidget(QWidget):
@@ -433,6 +593,11 @@ class DashboardV2(QMainWindow):
         header_layout.setContentsMargins(15, 0, 15, 0)
         
         title_label = QLabel("FocusFlow")
+        # 【新增】：数据大屏入口按钮
+        self.btn_dashboard = QPushButton("📊 数据大屏")
+        self.btn_dashboard.setStyleSheet("background-color: #31A8FF; color: white; font-weight: bold; padding: 4px 12px; border-radius: 4px; margin-left: 15px;")
+        self.btn_dashboard.clicked.connect(lambda: DataDashboardWindow(self).exec())
+        header_layout.addWidget(self.btn_dashboard)
         title_label.setObjectName("titleLabel")
         header_layout.addWidget(title_label)
         header_layout.addStretch()
