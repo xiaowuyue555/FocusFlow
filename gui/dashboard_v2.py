@@ -1424,11 +1424,26 @@ class DashboardV2(QMainWindow):
             # 项目时长
             target_pid = None
             if self.selected_uid_left and self.selected_uid_left.startswith("P_"):
+                # 用户手动选择了项目
                 target_pid = int(self.selected_uid_left[2:])
             else:
+                # 先查 file_assignment 表
                 row_pid = conn.execute("SELECT project_id FROM file_assignment WHERE file_path = ?", (active_fpath,)).fetchone()
-                if row_pid: target_pid = row_pid[0]
-                
+                if row_pid:
+                    target_pid = row_pid[0]
+                else:
+                    # 如果 file_assignment 没有，查 project_map 自动分配规则
+                    rules = conn.execute("""
+                        SELECT project_id, rule_path FROM project_map 
+                        WHERE rule_path IS NOT NULL AND rule_path != ''
+                        ORDER BY id DESC
+                    """).fetchall()
+                    
+                    for pid, rule in rules:
+                        if rule and rule.lower() in active_fpath.lower():
+                            target_pid = pid
+                            break
+            
             if target_pid:
                 p_name = conn.execute("SELECT project_name FROM projects WHERE id = ?", (target_pid,)).fetchone()[0]
                 stats = get_project_stats(target_pid, include_children=True)
