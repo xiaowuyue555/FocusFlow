@@ -269,13 +269,24 @@ def restore_project(project_id: int) -> bool:
     return True
 
 def get_project_stats(project_id: int, include_children: bool = False) -> Dict[str, float]:
+    """
+    获取项目统计数据（总时长、今日时长）
+    
+    【性能优化】：使用区间查询替代 DATE() 函数，使索引生效
+    """
+    from .database import get_connection, get_date_range
+    
     conn = get_connection()
     cursor = conn.cursor()
+    
+    # 获取今天的日期范围
+    today_start, tomorrow_start = get_date_range(0)
+    
+    all_ids = [project_id]
     
     if include_children:
         tree = load_project_tree()
         node = tree.get_node(project_id)
-        all_ids = [project_id]
         
         def collect_children(node):
             all_ids.extend([c.id for c in node.get_children()])
@@ -287,20 +298,20 @@ def get_project_stats(project_id: int, include_children: bool = False) -> Dict[s
         cursor.execute(f"""
             SELECT 
                 COALESCE(SUM(al.duration), 0) as total,
-                COALESCE(SUM(CASE WHEN DATE(al.timestamp) = DATE('now') THEN al.duration ELSE 0 END), 0) as today
+                COALESCE(SUM(CASE WHEN al.timestamp >= ? AND al.timestamp < ? THEN al.duration ELSE 0 END), 0) as today
             FROM activity_log al
             JOIN file_assignment fa ON al.file_path = fa.file_path
             WHERE fa.project_id IN ({placeholders})
-        """, all_ids)
+        """, [today_start, tomorrow_start] + all_ids)
     else:
         cursor.execute("""
             SELECT 
                 COALESCE(SUM(al.duration), 0) as total,
-                COALESCE(SUM(CASE WHEN DATE(al.timestamp) = DATE('now') THEN al.duration ELSE 0 END), 0) as today
+                COALESCE(SUM(CASE WHEN al.timestamp >= ? AND al.timestamp < ? THEN al.duration ELSE 0 END), 0) as today
             FROM activity_log al
             JOIN file_assignment fa ON al.file_path = fa.file_path
             WHERE fa.project_id = ?
-        """, (project_id,))
+        """, (today_start, tomorrow_start, project_id))
     
     row = cursor.fetchone()
     conn.close()

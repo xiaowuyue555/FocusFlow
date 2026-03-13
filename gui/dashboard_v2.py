@@ -28,7 +28,7 @@ from PySide6.QtGui import QStandardItemModel, QStandardItem, QFont, QPainter, QC
 from PySide6.QtCore import Qt, QModelIndex, QTimer, QItemSelectionModel
 from PySide6.QtWidgets import QSystemTrayIcon
 
-from core.database import get_connection, init_db, get_db_path, set_db_path, get_config, set_config
+from core.database import get_connection, init_db, get_db_path, set_db_path, get_config, set_config, get_date_range
 from core.project_tree import (
     load_project_tree, get_project_stats, get_all_projects_flat, 
     get_project_files, create_project, delete_project, 
@@ -616,14 +616,20 @@ class DataDashboardWindow(QDialog):
         start_date = (today - timedelta(days=6)).strftime('%Y-%m-%d')
         
         # --- 图表 1：过去 7 天每日趋势 (柱状图) ---
+        # 【性能优化】：使用区间查询替代 DATE(SUBSTR()) 函数，使索引生效
+        today = datetime.now()
+        start_date = (today - timedelta(days=6)).replace(hour=0, minute=0, second=0)
+        end_date = today.replace(hour=23, minute=59, second=59, microsecond=999999)
+        
         query_trend = """
             SELECT DATE(SUBSTR(timestamp, 1, 10)) as work_date, SUM(duration)/3600.0 as hours
             FROM activity_log
-            WHERE DATE(SUBSTR(timestamp, 1, 10)) >= ?
+            WHERE timestamp >= ? AND timestamp <= ?
             GROUP BY work_date
             ORDER BY work_date ASC
         """
-        df_trend = pd.read_sql_query(query_trend, conn, params=(start_date,))
+        df_trend = pd.read_sql_query(query_trend, conn, params=(start_date.strftime('%Y-%m-%d %H:%M:%S'), 
+                                                                 end_date.strftime('%Y-%m-%d %H:%M:%S')))
         
         # 补全可能缺失的日期（某天没干活也要显示 0）
         date_list = [(today - timedelta(days=i)).strftime('%Y-%m-%d') for i in range(6, -1, -1)]
@@ -653,16 +659,18 @@ class DataDashboardWindow(QDialog):
                 ax_bar.text(bar.get_x() + bar.get_width()/2, yval + 0.1, round(yval, 1), ha='center', va='bottom', color='#FFFFFF', fontsize=10)
 
         # --- 图表 2：过去 7 天各项目时间占比 (环形饼图) ---
+        # 【性能优化】：使用区间查询替代 DATE(SUBSTR()) 函数
         query_pie = """
             SELECT p.project_name, SUM(al.duration) as total_secs
             FROM activity_log al
             JOIN file_assignment fa ON al.file_path = fa.file_path
             JOIN projects p ON fa.project_id = p.id
-            WHERE DATE(SUBSTR(al.timestamp, 1, 10)) >= ?
+            WHERE timestamp >= ? AND timestamp <= ?
             GROUP BY p.project_name
             ORDER BY total_secs DESC
         """
-        df_pie = pd.read_sql_query(query_pie, conn, params=(start_date,))
+        df_pie = pd.read_sql_query(query_pie, conn, params=(start_date.strftime('%Y-%m-%d %H:%M:%S'),
+                                                             end_date.strftime('%Y-%m-%d %H:%M:%S')))
         conn.close()
         
         ax_pie = self.fig_pie.add_subplot(111)
@@ -1341,11 +1349,13 @@ class DashboardV2(QMainWindow):
                 item_today.setText(format_duration(stats['today']))
             elif fpath:
                 # 这是一个文件，直接用 SQL 极速查出它的最新时长
+                # 【性能优化】：使用区间查询替代 DATE() 函数，使索引生效
+                today_start, tomorrow_start = get_date_range(0)
                 row = conn.execute("""
                     SELECT COALESCE(SUM(duration), 0), 
-                           COALESCE(SUM(CASE WHEN DATE(timestamp) = DATE('now', 'localtime') THEN duration ELSE 0 END), 0) 
+                           COALESCE(SUM(CASE WHEN timestamp >= ? AND timestamp < ? THEN duration ELSE 0 END), 0) 
                     FROM activity_log WHERE file_path = ?
-                """, (fpath,)).fetchone()
+                """, (today_start, tomorrow_start, fpath)).fetchone()
                 if row:
                     item_total.setText(format_duration(row[0]))
                     item_today.setText(format_duration(row[1]))
@@ -1414,11 +1424,13 @@ class DashboardV2(QMainWindow):
             d_path = active_fpath if active_fpath.startswith("[") else os.path.basename(active_fpath)
             
             # 程序时长
+            # 【性能优化】：使用区间查询替代 DATE(SUBSTR()) 函数，使索引生效
+            today_start, tomorrow_start = get_date_range(0)
             row_app = conn.execute("""
                 SELECT COALESCE(SUM(duration), 0), 
-                       COALESCE(SUM(CASE WHEN DATE(SUBSTR(timestamp, 1, 10)) = ? THEN duration ELSE 0 END), 0)
+                       COALESCE(SUM(CASE WHEN timestamp >= ? AND timestamp < ? THEN duration ELSE 0 END), 0)
                 FROM activity_log WHERE file_path = ?
-            """, (datetime.now().strftime('%Y-%m-%d'), active_fpath)).fetchone()
+            """, (today_start, tomorrow_start, active_fpath)).fetchone()
             if row_app: a_total, a_today = row_app[0], row_app[1]
 
             # 项目时长
@@ -1484,17 +1496,17 @@ class DashboardV2(QMainWindow):
     def _update_timeline(self):
         # 提取今日所有秒级日志，聚合成连续的时间块
         conn = get_connection()
-        today_str = datetime.now().strftime('%Y-%m-%d')
+        
+        # 【性能优化】：使用区间查询替代 DATE(SUBSTR()) 函数，使索引生效
+        today_start, tomorrow_start = get_date_range(0)
         
         # 1. 查出今天的真实工作记录（原始秒级记录，在 Python 中按连续时段聚合后再过滤）
-        # 【修复 2】：去掉 'localtime' 修饰符，因为存入数据库的 datetime.now().isoformat() 本身就已经是本地时间了！
-        # 如果再次加 'localtime' 会导致 SQLite 进行二次时区转换，从而把昨天半夜 23 点错认为今天。
         logs = conn.execute("""
             SELECT timestamp, duration, app_name, file_path 
             FROM activity_log 
-            WHERE DATE(SUBSTR(timestamp, 1, 10)) = ?
+            WHERE timestamp >= ? AND timestamp < ?
             ORDER BY timestamp ASC
-        """, (today_str,)).fetchall()
+        """, (today_start, tomorrow_start)).fetchall()
         
         # 2. 查出今天的闲置记录 (从 runtime_status 衍生，或者由于后台在闲置时根本不记入 activity_log，这里会有时间断层)
         # 我们用“找时间断层”的方法，反推你今天几点在闲置！
@@ -1554,17 +1566,19 @@ class DashboardV2(QMainWindow):
         item_today.setSelectable(False)
         parent_item.appendRow([item_name, item_total, item_today])
         
-        # 【修复1：直接用精准 SQL 查本项目的子文件时间，解决时间为 0 的问题】
+        # 【修复 1：直接用精准 SQL 查本项目的子文件时间，解决时间为 0 的问题】
         conn = get_connection()
+        # 【性能优化】：使用区间查询替代 DATE() 函数，使索引生效
+        today_start, tomorrow_start = get_date_range(0)
         files = conn.execute("""
             SELECT fa.file_path, MAX(al.app_name), 
                    COALESCE(SUM(al.duration), 0), 
-                   COALESCE(SUM(CASE WHEN DATE(al.timestamp) = DATE('now', 'localtime') THEN al.duration ELSE 0 END), 0)
+                   COALESCE(SUM(CASE WHEN al.timestamp >= ? AND al.timestamp < ? THEN al.duration ELSE 0 END), 0)
             FROM file_assignment fa
             LEFT JOIN activity_log al ON fa.file_path = al.file_path
             WHERE fa.project_id = ?
             GROUP BY fa.file_path
-        """, (node.id,)).fetchall()
+        """, (today_start, tomorrow_start, node.id)).fetchall()
         conn.close()
 
         for fpath, app_name, f_total_dur, f_today_dur in files:
@@ -1597,18 +1611,20 @@ class DashboardV2(QMainWindow):
         
         conn = get_connection()
         cursor = conn.cursor()
+        # 【性能优化】：使用区间查询替代 DATE() 函数，使索引生效
+        today_start, tomorrow_start = get_date_range(0)
         cursor.execute("""
             SELECT al.app_name, al.file_path, SUM(al.duration) as total,
-                SUM(CASE WHEN DATE(al.timestamp) = DATE('now', 'localtime') THEN al.duration ELSE 0 END) as today,
+                SUM(CASE WHEN al.timestamp >= ? AND al.timestamp < ? THEN al.duration ELSE 0 END) as today,
                 MAX(al.timestamp) as last_seen
             FROM activity_log al
             LEFT JOIN file_assignment fa ON al.file_path = fa.file_path
             LEFT JOIN ignore_list il ON al.app_name LIKE '%' || il.keyword || '%' OR al.file_path LIKE '%' || il.keyword || '%'
             WHERE fa.file_path IS NULL AND il.keyword IS NULL
             GROUP BY al.app_name, al.file_path
-            HAVING SUM(al.duration) >= ?  -- 【新增】时长筛选
+            HAVING SUM(al.duration) >= ?
             ORDER BY al.app_name, last_seen DESC
-        """, (self.filter_threshold_seconds,))
+        """, (today_start, tomorrow_start, self.filter_threshold_seconds))
         new_data = cursor.fetchall()
         conn.close()
         

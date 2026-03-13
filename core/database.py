@@ -27,6 +27,11 @@ def init_db():
     conn = get_connection()
     cursor = conn.cursor()
     
+    # ================= 性能优化：启用 WAL 模式 =================
+    # WAL (Write-Ahead Logging) 允许读写并发，提升性能
+    # 必须在其他操作之前执行
+    cursor.execute('''PRAGMA journal_mode = WAL''')
+    
     # 1. 基础活动日志表
     cursor.execute('''CREATE TABLE IF NOT EXISTS activity_log 
         (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp DATETIME, app_name TEXT, file_path TEXT, duration REAL)''')
@@ -99,6 +104,24 @@ def init_db():
     # 初始化默认配置 (如果不存在的话)
     cursor.execute("INSERT OR IGNORE INTO system_config (key, value) VALUES ('idle_threshold', '30')")
     
+    # ================= 性能优化：创建索引 =================
+    
+    # 1. timestamp 索引 - 加速时间范围查询（今日统计、过去 7 天趋势）
+    cursor.execute('''CREATE INDEX IF NOT EXISTS idx_activity_log_timestamp 
+                      ON activity_log(timestamp)''')
+    
+    # 2. file_path 索引 - 加速路径匹配查询（项目自动分配）
+    cursor.execute('''CREATE INDEX IF NOT EXISTS idx_activity_log_file_path 
+                      ON activity_log(file_path)''')
+    
+    # 3. app_name 索引 - 加速应用筛选查询
+    cursor.execute('''CREATE INDEX IF NOT EXISTS idx_activity_log_app_name 
+                      ON activity_log(app_name)''')
+    
+    # 4. 复合索引 - 优化同时使用时间和路径的查询
+    cursor.execute('''CREATE INDEX IF NOT EXISTS idx_activity_log_timestamp_path 
+                      ON activity_log(timestamp, file_path)''')
+    
     conn.commit()
     conn.close()
 
@@ -121,6 +144,31 @@ def set_config(key, value):
     """, (key, value))
     conn.commit()
     conn.close()
+
+
+def get_date_range(days_back=0):
+    """
+    获取日期范围用于区间查询（替代 DATE() 函数，使索引生效）
+    
+    Args:
+        days_back: 往前推多少天（0 表示今天）
+    
+    Returns:
+        tuple: (start_date_str, end_date_str) 格式：'YYYY-MM-DD HH:MM:SS'
+    """
+    from datetime import datetime, timedelta
+    
+    if days_back == 0:
+        # 今天：从今天 00:00:00 到明天 00:00:00
+        today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        tomorrow = today + timedelta(days=1)
+        return today.strftime('%Y-%m-%d %H:%M:%S'), tomorrow.strftime('%Y-%m-%d %H:%M:%S')
+    else:
+        # 过去 N 天：从 N 天前 00:00:00 到今天 23:59:59
+        start_date = datetime.now() - timedelta(days=days_back)
+        start_date = start_date.replace(hour=0, minute=0, second=0, microsecond=0)
+        end_date = datetime.now().replace(hour=23, minute=59, second=59, microsecond=999999)
+        return start_date.strftime('%Y-%m-%d %H:%M:%S'), end_date.strftime('%Y-%m-%d %H:%M:%S')
 
 
 def init_project_tree():
