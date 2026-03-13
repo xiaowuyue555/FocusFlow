@@ -839,7 +839,16 @@ class DashboardV2(QMainWindow):
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
         right_layout.setContentsMargins(5, 10, 10, 10)
-        right_layout.addWidget(QLabel("📥 Inbox 待分配 (自动捕获)", objectName="panelTitle"))
+        
+        # 【新增】Inbox 标题栏（带分组视图切换）
+        right_header = QHBoxLayout()
+        right_header.addWidget(QLabel("📥 Inbox 待分配 (自动捕获)", objectName="panelTitle"))
+        right_header.addStretch()
+        self.btn_inbox_group = QCheckBox("📊 分组视图")
+        self.btn_inbox_group.setChecked(False)
+        self.btn_inbox_group.stateChanged.connect(self.refresh_data)
+        right_header.addWidget(self.btn_inbox_group)
+        right_layout.addLayout(right_header)
         
         self.tree_inbox = QTreeView()
         self.tree_inbox.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -870,6 +879,11 @@ class DashboardV2(QMainWindow):
         self.tree_inbox.setColumnWidth(3, 70)
         self.tree_inbox.setSortingEnabled(True)         # 允许点击表头排序
         self.model_inbox.setSortRole(Qt.UserRole + 3)   # 告诉它按底层数字大小排，而不是按字符串排
+        
+        # 【新增】Inbox 分组视图状态管理
+        self.inbox_expanded_apps = set()  # 记录展开的程序名
+        self.inbox_group_mode = False     # 当前是否分组视图模式
+        
 # --- 5. 【新增】底部时间轴 ---
         self.timeline = TimelineWidget()
         main_layout.addWidget(self.timeline)
@@ -902,6 +916,16 @@ class DashboardV2(QMainWindow):
             item = self.model_inbox.itemFromIndex(idx.siblingAtColumn(0))
             if item:
                 self.selected_path_right = item.data(Qt.UserRole + 1)
+        
+        # 【新增】保存 Inbox 分组展开状态
+        if self.inbox_group_mode:
+            self.inbox_expanded_apps.clear()
+            for i in range(self.model_inbox.rowCount()):
+                item = self.model_inbox.item(i, 0)
+                if item and item.data(Qt.UserRole + 6):  # 是分组头
+                    app_name = item.data(Qt.UserRole + 5)
+                    if app_name and self.tree_inbox.isExpanded(self.model_inbox.index(i, 0)):
+                        self.inbox_expanded_apps.add(app_name)
             
         # 记录滚动条位置
         self.scroll_l = self.tree_projects.verticalScrollBar().value()
@@ -925,14 +949,26 @@ class DashboardV2(QMainWindow):
         
         # 恢复右侧选中状态
         if self.selected_path_right:
-            for i in range(self.model_inbox.rowCount()):
-                item = self.model_inbox.item(i, 0)
-                if item and item.data(Qt.UserRole + 1) == self.selected_path_right:
-                    # 重新高亮这一行
-                    self.tree_inbox.selectionModel().select(item.index(), QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Rows)
-                    # 把焦点指回去，防止键盘下滚失效
-                    self.tree_inbox.setCurrentIndex(item.index())
-                    break
+            # 【增强】支持在分组视图模式下恢复选中状态
+            if self.inbox_group_mode:
+                # 分组模式下，文件在分组头的子项中
+                for i in range(self.model_inbox.rowCount()):
+                    header_item = self.model_inbox.item(i, 0)
+                    if header_item and header_item.data(Qt.UserRole + 6):  # 是分组头
+                        for j in range(header_item.rowCount()):
+                            file_item = header_item.child(j, 0)
+                            if file_item and file_item.data(Qt.UserRole + 1) == self.selected_path_right:
+                                self.tree_inbox.selectionModel().select(file_item.index(), QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Rows)
+                                self.tree_inbox.setCurrentIndex(file_item.index())
+                                break
+            else:
+                # 普通列表模式
+                for i in range(self.model_inbox.rowCount()):
+                    item = self.model_inbox.item(i, 0)
+                    if item and item.data(Qt.UserRole + 1) == self.selected_path_right:
+                        self.tree_inbox.selectionModel().select(item.index(), QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Rows)
+                        self.tree_inbox.setCurrentIndex(item.index())
+                        break
                     
         # 恢复滚动条位置
         self.tree_projects.verticalScrollBar().setValue(getattr(self, 'scroll_l', 0))
@@ -1242,6 +1278,9 @@ class DashboardV2(QMainWindow):
         
 
     def _load_inbox_data(self):
+        # 【新增】：同步分组视图模式状态
+        self.inbox_group_mode = self.btn_inbox_group.isChecked()
+        
         conn = get_connection()
         cursor = conn.cursor()
         cursor.execute("""
@@ -1253,67 +1292,165 @@ class DashboardV2(QMainWindow):
             LEFT JOIN ignore_list il ON al.app_name LIKE '%' || il.keyword || '%' OR al.file_path LIKE '%' || il.keyword || '%'
             WHERE fa.file_path IS NULL AND il.keyword IS NULL
             GROUP BY al.app_name, al.file_path
-            ORDER BY last_seen DESC
+            ORDER BY al.app_name, last_seen DESC
         """)
         new_data = cursor.fetchall()
         conn.close()
         
-        # 提取现有模型里的 file_path 集合，记住它们的真实行号
-        existing_paths = {}
-        for i in range(self.model_inbox.rowCount()):
-            item = self.model_inbox.item(i, 0)
-            existing_paths[item.data(Qt.UserRole + 1)] = i
-
-        new_paths_set = {row[1] for row in new_data}
+        # 【增强显示格式】：智能格式化文件名，带上程序前缀
+        def format_display_name(app_name, file_path):
+            """生成带程序前缀的智能显示名称"""
+            if file_path.startswith("["):
+                return file_path.strip("[]")
+            
+            base_name = os.path.basename(file_path)
+            vague_titles = {"无标题", "应用", "打开", "未命名", "Untitled", "New", "文档", "窗口"}
+            is_vague = any(vague in base_name for vague in vague_titles) or base_name == app_name
+            
+            if is_vague:
+                parts = file_path.split('/')
+                short_path = "/".join(parts[-2:]) if len(parts) > 2 else file_path
+                return f"[{app_name}] {short_path}"
+            else:
+                return f"[{app_name}] {base_name}"
         
-        # 【修复2 & 3：只要列表里的程序数量和种类没变，就绝对不重构列表！只精准更新时间的数字】
-        if set(existing_paths.keys()) == new_paths_set:
-            for row in new_data:
-                app_name, file_path, total, today, last_seen = row
-                try: time_str = datetime.fromisoformat(last_seen.split('.')[0]).strftime("%m-%d %H:%M")
-                except: time_str = last_seen
-                
-                # 找到它在界面的真实行号，精准更新（杜绝张冠李戴！）
-                row_idx = existing_paths[file_path]
-                
-                # 【修正】：统一使用 row_idx
-                it_total = self.model_inbox.item(row_idx, 2)
-                it_total.setText(format_duration(total))
-                it_total.setData(total, Qt.UserRole + 3)
-
-                it_today = self.model_inbox.item(row_idx, 3)
-                it_today.setText(format_duration(today))
-                it_today.setData(today, Qt.UserRole + 3)
-
-                it_last = self.model_inbox.item(row_idx, 4)
-                it_last.setText(time_str)
-                it_last.setData(last_seen, Qt.UserRole + 3)
+        # 【新增】计算 Inbox 结构指纹（只有文件集合变化时才重绘）
+        current_inbox_hash = hash(str(sorted([(row[0], row[1]) for row in new_data])))
+        
+        # 【分组视图模式】
+        if self.inbox_group_mode:
+            # 检查结构是否变化
+            if getattr(self, 'last_inbox_hash', None) == current_inbox_hash:
+                # 结构没变，只更新时间数字（不破坏展开状态）
+                self._update_inbox_durations_in_group_mode(new_data, format_display_name)
+            else:
+                # 结构变化，重新绘制
+                self._render_inbox_group_mode(new_data, format_display_name)
+                self.last_inbox_hash = current_inbox_hash
+        
+        # 【普通列表视图模式】
         else:
-            # 只有当有全新的程序第一次加进来，或者被分配移出时，才重新排版
-            self.model_inbox.removeRows(0, self.model_inbox.rowCount())
-            for row in new_data:
-                app_name, file_path, total, today, last_seen = row
-                if file_path.startswith("["):
-                    d_name, d_dir = file_path, app_name
-                else:
-                    d_name, d_dir = os.path.basename(file_path), os.path.dirname(file_path)
+            existing_paths = {}
+            for i in range(self.model_inbox.rowCount()):
+                item = self.model_inbox.item(i, 0)
+                existing_paths[item.data(Qt.UserRole + 1)] = i
+
+            new_paths_set = {row[1] for row in new_data}
+            
+            if set(existing_paths.keys()) == new_paths_set:
+                # 精准更新时间数字
+                for row in new_data:
+                    app_name, file_path, total, today, last_seen = row
+                    try: time_str = datetime.fromisoformat(last_seen.split('.')[0]).strftime("%m-%d %H:%M")
+                    except: time_str = last_seen
                     
+                    row_idx = existing_paths[file_path]
+                    it_total = self.model_inbox.item(row_idx, 2)
+                    it_total.setText(format_duration(total))
+                    it_total.setData(total, Qt.UserRole + 3)
+
+                    it_today = self.model_inbox.item(row_idx, 3)
+                    it_today.setText(format_duration(today))
+                    it_today.setData(today, Qt.UserRole + 3)
+
+                    it_last = self.model_inbox.item(row_idx, 4)
+                    it_last.setText(time_str)
+                    it_last.setData(last_seen, Qt.UserRole + 3)
+            else:
+                # 重新排版
+                self.model_inbox.removeRows(0, self.model_inbox.rowCount())
+                for row in new_data:
+                    app_name, file_path, total, today, last_seen = row
+                    d_name = format_display_name(app_name, file_path)
+                    
+                    if file_path.startswith("["):
+                        d_dir = app_name
+                    else:
+                        d_dir = os.path.dirname(file_path)
+                        
+                    try: time_str = datetime.fromisoformat(last_seen.split('.')[0]).strftime("%m-%d %H:%M")
+                    except: time_str = last_seen
+                        
+                    item_name = QStandardItem(d_name)
+                    item_name.setData(file_path, Qt.UserRole + 1)
+                    item_name.setData(app_name, Qt.UserRole + 2)
+                    item_name.setData(d_name.lower(), Qt.UserRole + 3)
+                    item_name.setToolTip(file_path)
+                    
+                    item_dir = QStandardItem(d_dir)
+                    item_dir.setData(d_dir.lower(), Qt.UserRole + 3)
+                    item_dir.setToolTip(file_path)
+                    
+                    item_total = QStandardItem(format_duration(total))
+                    item_total.setData(total, Qt.UserRole + 3)
+                    
+                    item_today = QStandardItem(format_duration(today))
+                    item_today.setData(today, Qt.UserRole + 3)
+                    
+                    item_last = QStandardItem(time_str)
+                    item_last.setData(last_seen, Qt.UserRole + 3)
+                    
+                    self.model_inbox.appendRow([item_name, item_dir, item_total, item_today, item_last])
+    
+    # 【新增】分组视图模式：渲染 Inbox（结构变化时调用）
+    def _render_inbox_group_mode(self, new_data, format_display_name):
+        from collections import defaultdict
+        self.model_inbox.removeRows(0, self.model_inbox.rowCount())
+        
+        # 按程序名分组数据
+        grouped_data = defaultdict(list)
+        for row in new_data:
+            app_name, file_path, total, today, last_seen = row
+            grouped_data[app_name].append(row)
+        
+        # 为每个程序创建分组头
+        for app_name in sorted(grouped_data.keys()):
+            files = grouped_data[app_name]
+            
+            # 创建分组头（不可选中，带图标和文件数）
+            app_icon = "🎯"
+            header_item = QStandardItem(f"{app_icon} {app_name} ({len(files)}个文件)")
+            header_item.setSelectable(False)
+            header_item.setData(app_name, Qt.UserRole + 5)  # 标记为程序分组头
+            header_item.setData(True, Qt.UserRole + 6)      # 标记是分组头
+            
+            # 创建占位列
+            header_total = QStandardItem("")
+            header_total.setSelectable(False)
+            header_today = QStandardItem("")
+            header_today.setSelectable(False)
+            header_last = QStandardItem("")
+            header_last.setSelectable(False)
+            
+            # 添加分组头到模型
+            self.model_inbox.appendRow([header_item, header_total, header_today, header_last])
+            header_index = self.model_inbox.rowCount() - 1
+            
+            # 设置展开/折叠状态
+            if app_name in self.inbox_expanded_apps:
+                self.tree_inbox.setExpanded(self.model_inbox.index(header_index, 0), True)
+            else:
+                self.tree_inbox.setExpanded(self.model_inbox.index(header_index, 0), False)
+            
+            # 为该程序下的每个文件创建子项
+            for row in files:
+                app_name, file_path, total, today, last_seen = row
+                d_name = format_display_name(app_name, file_path)
+                d_dir = app_name if file_path.startswith("[") else os.path.dirname(file_path)
+                
                 try: time_str = datetime.fromisoformat(last_seen.split('.')[0]).strftime("%m-%d %H:%M")
                 except: time_str = last_seen
-                    
+                
                 item_name = QStandardItem(d_name)
                 item_name.setData(file_path, Qt.UserRole + 1)
                 item_name.setData(app_name, Qt.UserRole + 2)
-                # 【新增】：给第 1 列埋入用于排序的纯文本（小写，保证字母表顺序准确）
                 item_name.setData(d_name.lower(), Qt.UserRole + 3)
                 item_name.setToolTip(file_path)
                 
                 item_dir = QStandardItem(d_dir)
-                # 【新增】：给第 2 列埋入用于排序的纯文本
                 item_dir.setData(d_dir.lower(), Qt.UserRole + 3)
                 item_dir.setToolTip(file_path)
                 
-                # 【新增】：给单元格底部埋入真实秒数/时间戳，用于数学排序
                 item_total = QStandardItem(format_duration(total))
                 item_total.setData(total, Qt.UserRole + 3)
                 
@@ -1323,7 +1460,46 @@ class DashboardV2(QMainWindow):
                 item_last = QStandardItem(time_str)
                 item_last.setData(last_seen, Qt.UserRole + 3)
                 
-                self.model_inbox.appendRow([item_name, item_dir, item_total, item_today, item_last])
+                # 添加到分组头下
+                header_item.appendRow([item_name, item_dir, item_total, item_today, item_last])
+    
+    # 【新增】分组视图模式：只更新时间数字（保持展开状态）
+    def _update_inbox_durations_in_group_mode(self, new_data, format_display_name):
+        # 构建 {file_path: (total, today, last_seen)} 的映射
+        data_map = {}
+        for row in new_data:
+            app_name, file_path, total, today, last_seen = row
+            data_map[file_path] = (total, today, last_seen)
+        
+        # 遍历所有分组头下的子项，精准更新
+        for i in range(self.model_inbox.rowCount()):
+            header_item = self.model_inbox.item(i, 0)
+            if header_item and header_item.data(Qt.UserRole + 6):  # 是分组头
+                for j in range(header_item.rowCount()):
+                    file_item = header_item.child(j, 0)
+                    if file_item:
+                        fpath = file_item.data(Qt.UserRole + 1)
+                        if fpath in data_map:
+                            total, today, last_seen = data_map[fpath]
+                            
+                            # 更新对应列
+                            it_total = header_item.child(j, 2)
+                            it_today = header_item.child(j, 3)
+                            it_last = header_item.child(j, 4)
+                            
+                            if it_total:
+                                it_total.setText(format_duration(total))
+                                it_total.setData(total, Qt.UserRole + 3)
+                            
+                            if it_today:
+                                it_today.setText(format_duration(today))
+                                it_today.setData(today, Qt.UserRole + 3)
+                            
+                            if it_last:
+                                try: time_str = datetime.fromisoformat(last_seen.split('.')[0]).strftime("%m-%d %H:%M")
+                                except: time_str = last_seen
+                                it_last.setText(time_str)
+                                it_last.setData(last_seen, Qt.UserRole + 3)
 
     # ================= 右键菜单交互 (保持不变) =================
     def show_project_menu(self, pos):
@@ -1366,13 +1542,31 @@ class DashboardV2(QMainWindow):
         index = self.tree_inbox.indexAt(pos)
         if not index.isValid(): return
         item = self.model_inbox.itemFromIndex(index.siblingAtColumn(0))
-        f_path = item.data(Qt.UserRole + 1)
-        a_name = item.data(Qt.UserRole + 2)
-
-        menu = QMenu(self)
-        menu.addAction("➡️ 手动分配到项目...").triggered.connect(lambda: self.action_assign_item(f_path))
-        menu.addSeparator()
-        menu.addAction("🚫 永久忽略 (加黑名单)").triggered.connect(lambda: self.action_ignore_item(a_name))
+        
+        # 【新增】判断是否点击在分组头上
+        is_header = item.data(Qt.UserRole + 6)
+        app_name = item.data(Qt.UserRole + 5)  # 分组头的程序名
+        
+        if is_header and app_name:
+            # 分组头右键菜单：批量分配
+            menu = QMenu(self)
+            menu.addAction(f"➡️ 批量分配 \"{app_name}\" 的所有文件到项目...").triggered.connect(
+                lambda: self.action_assign_app_batch(app_name)
+            )
+            menu.addSeparator()
+            menu.addAction("🚫 永久忽略此程序的所有文件").triggered.connect(
+                lambda: self.action_ignore_app(app_name)
+            )
+        else:
+            # 普通文件右键菜单
+            f_path = item.data(Qt.UserRole + 1)
+            a_name = item.data(Qt.UserRole + 2)
+            
+            menu = QMenu(self)
+            menu.addAction("➡️ 手动分配到项目...").triggered.connect(lambda: self.action_assign_item(f_path))
+            menu.addSeparator()
+            menu.addAction("🚫 永久忽略 (加黑名单)").triggered.connect(lambda: self.action_ignore_item(a_name))
+        
         menu.exec(self.tree_inbox.viewport().mapToGlobal(pos))
 
     # --- 动作实现 (保持不变) ---
@@ -1605,6 +1799,83 @@ class DashboardV2(QMainWindow):
                 self.refresh_data()
             except sqlite3.IntegrityError:
                 QMessageBox.warning(self, "提示", "该关键词已在黑名单中。")
+    
+    # 【新增】批量分配某程序的所有文件
+    def action_assign_app_batch(self, app_name):
+        projects = [p for p in get_all_projects_flat() if not p['is_archived']]
+        if not projects:
+            return QMessageBox.warning(self, "提示", "请先在左侧新建一个项目！")
+        
+        # 确认对话框
+        reply = QMessageBox.question(
+            self, "批量分配确认",
+            f"确定要将 \"{app_name}\" 的所有待分配文件都分配到同一个项目吗？",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+        
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"批量分配 - {app_name}")
+        layout = QVBoxLayout(dlg)
+        layout.addWidget(QLabel(f"选择目标项目："))
+        
+        combo = QComboBox()
+        for p in projects:
+            combo.addItem(p['name'], p['id'])
+        layout.addWidget(combo)
+        
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        layout.addWidget(btns)
+        
+        if dlg.exec() == QDialog.Accepted:
+            target_project_id = combo.currentData()
+            conn = get_connection()
+            
+            # 获取该程序所有未分配的文件
+            files = conn.execute("""
+                SELECT DISTINCT file_path FROM activity_log 
+                WHERE app_name = ? 
+                AND file_path NOT IN (SELECT file_path FROM file_assignment)
+            """, (app_name,)).fetchall()
+            
+            count = 0
+            for (file_path,) in files:
+                if file_path:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO file_assignment (file_path, project_id, assigned_at) VALUES (?, ?, ?)",
+                        (file_path, target_project_id, datetime.now().isoformat())
+                    )
+                    count += 1
+            
+            conn.commit()
+            conn.close()
+            
+            QMessageBox.information(self, "完成", f"已将 {count} 个文件分配到项目。")
+            self.refresh_data()
+    
+    # 【新增】批量忽略某程序的所有文件
+    def action_ignore_app(self, app_name):
+        reply = QMessageBox.question(
+            self, "批量忽略确认",
+            f"确定要将 \"{app_name}\" 加入黑名单吗？\n该程序未来的所有记录都将被忽略。",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+        
+        try:
+            conn = get_connection()
+            conn.execute("INSERT INTO ignore_list (keyword, created_at) VALUES (?, ?)", 
+                        (app_name, datetime.now().isoformat()))
+            conn.commit()
+            conn.close()
+            QMessageBox.information(self, "完成", f"已将 \"{app_name}\" 加入黑名单。")
+            self.refresh_data()
+        except sqlite3.IntegrityError:
+            QMessageBox.warning(self, "提示", "该程序已在黑名单中。")
 
     def apply_modern_theme(self):
         self.setStyleSheet("""
