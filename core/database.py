@@ -1033,3 +1033,168 @@ def init_project_tree():
     
     conn.commit()
     conn.close()
+
+
+# ================= 时间轴查询功能 =================
+
+def query_timeline_data(date, app_filter=None, project_filter=None):
+    """
+    查询指定日期的时间轴数据
+    
+    Args:
+        date: 日期字符串 'YYYY-MM-DD'
+        app_filter: 应用筛选（可选），None 表示全部
+        project_filter: 项目筛选（可选），None 表示全部
+    
+    Returns:
+        list of dict: [
+            {
+                'timestamp': '2026-03-13 08:00:00',
+                'app_name': 'VSCode',
+                'file_path': '/path/to/file.py',
+                'duration': 1500,
+                'project_name': 'Project A'  # 如果没有项目则为 None
+            },
+            ...
+        ]
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    # 计算日期范围
+    start_datetime = f"{date} 00:00:00"
+    end_datetime = f"{date} 23:59:59"
+    
+    # 基础查询（主表）
+    query = """
+        SELECT al.timestamp, al.app_name, al.file_path, al.duration, p.project_name
+        FROM activity_log al
+        LEFT JOIN file_assignment fa ON al.file_path = fa.file_path
+        LEFT JOIN projects p ON fa.project_id = p.id
+        WHERE al.timestamp >= ? AND al.timestamp <= ?
+    """
+    params = [start_datetime, end_datetime]
+    
+    # 添加筛选条件
+    if app_filter and app_filter != '全部':
+        query += " AND al.app_name = ?"
+        params.append(app_filter)
+    
+    if project_filter and project_filter != '全部':
+        if project_filter == '未分配':
+            query += " AND p.project_name IS NULL"
+        else:
+            query += " AND p.project_name = ?"
+            params.append(project_filter)
+    
+    query += " ORDER BY al.timestamp ASC"
+    
+    cursor.execute(query, params)
+    rows = cursor.fetchall()
+    
+    # 检查是否需要查询归档表
+    from datetime import datetime
+    query_date = datetime.strptime(date, '%Y-%m-%d')
+    
+    # 如果查询的是以前的月份，可能需要查询归档表
+    if not is_recent_month(query_date.year, query_date.month):
+        archive_table = get_archive_table_name(query_date.year, query_date.month)
+        if table_exists(archive_table):
+            # 查询归档表
+            archive_query = """
+                SELECT timestamp, app_name, file_path, duration, NULL as project_name
+                FROM {table}
+                WHERE timestamp >= ? AND timestamp <= ?
+            """.format(table=archive_table)
+            
+            archive_params = [start_datetime, end_datetime]
+            
+            if app_filter and app_filter != '全部':
+                archive_query += " AND app_name = ?"
+                archive_params.append(app_filter)
+            
+            cursor.execute(archive_query, archive_params)
+            archive_rows = cursor.fetchall()
+            rows.extend(archive_rows)
+    
+    conn.close()
+    
+    # 转换为字典列表
+    result = []
+    for row in rows:
+        result.append({
+            'timestamp': row[0],
+            'app_name': row[1],
+            'file_path': row[2],
+            'duration': row[3],
+            'project_name': row[4]
+        })
+    
+    return result
+
+
+def get_unique_apps():
+    """
+    获取所有唯一的应用名称列表
+    
+    Returns:
+        list: ['VSCode', 'Chrome', '微信', ...]
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    # 从主表查询
+    cursor.execute("""
+        SELECT DISTINCT app_name FROM activity_log
+        ORDER BY app_name ASC
+    """)
+    apps = [row[0] for row in cursor.fetchall()]
+    
+    # 从归档表查询（最近 6 个月）
+    from datetime import datetime
+    today = datetime.now()
+    for i in range(6):
+        # 计算月份
+        month = today.month - i
+        year = today.year
+        if month <= 0:
+            month += 12
+            year -= 1
+        
+        archive_table = get_archive_table_name(year, month)
+        if table_exists(archive_table):
+            cursor.execute(f"""
+                SELECT DISTINCT app_name FROM {archive_table}
+                ORDER BY app_name ASC
+            """)
+            archive_apps = [row[0] for row in cursor.fetchall()]
+            apps.extend(archive_apps)
+    
+    conn.close()
+    
+    # 去重并排序
+    return sorted(list(set(apps)))
+
+
+def get_unique_projects():
+    """
+    获取所有唯一的项目名称列表
+    
+    Returns:
+        list: ['Project A', 'Project B', ...]
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        SELECT DISTINCT project_name FROM projects
+        ORDER BY project_name ASC
+    """)
+    projects = [row[0] for row in cursor.fetchall()]
+    
+    conn.close()
+    
+    # 添加"未分配"选项
+    projects.append('未分配')
+    
+    return projects

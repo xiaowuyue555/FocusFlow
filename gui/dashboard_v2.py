@@ -22,7 +22,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QSplitter, QTreeView, QHeaderView, QLabel, QPushButton, QMenu,
     QAbstractItemView, QDialog, QComboBox, QDialogButtonBox, QMessageBox, 
-    QInputDialog, QSpinBox, QFormLayout, QGroupBox, QCheckBox, QListWidget, QListWidgetItem,QFileDialog, QFrame
+    QInputDialog, QSpinBox, QFormLayout, QGroupBox, QCheckBox, QListWidget, QListWidgetItem,QFileDialog, QFrame, QSizePolicy, QScrollArea
 )
 from PySide6.QtGui import QStandardItemModel, QStandardItem, QFont, QPainter, QColor, QPen, QBrush, QIcon, QAction, QPixmap
 from PySide6.QtCore import Qt, QModelIndex, QTimer, QItemSelectionModel
@@ -35,6 +35,7 @@ from core.project_tree import (
     archive_project, restore_project, remove_file_assignment
 )
 from gui.data_management import DataManagementDialog
+from core.database import get_unique_apps, get_unique_projects, query_timeline_data
 
 import sys
 import os
@@ -569,8 +570,8 @@ class DataDashboardWindow(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("📊 生产力数据大屏 (本周洞察)")
-        self.resize(1000, 600)  # 给图表足够的空间
-        self.setMinimumSize(800, 500)
+        self.resize(1200, 800)  # 加宽以容纳时间轴
+        self.setMinimumSize(900, 600)
         
         # 强制 Matplotlib 使用 Mac 系统自带的中文字体（防止中文变成小方块）
         import platform
@@ -583,8 +584,14 @@ class DataDashboardWindow(QDialog):
         # 采用深色酷炫主题
         plt.style.use('dark_background')
         
+        # 默认日期为今天
+        self.selected_date = datetime.now().strftime('%Y-%m-%d')
+        
         self.setup_ui()
         self.load_and_draw_data()
+        
+        # 加载时间轴数据
+        self.refresh_timeline()
 
     def setup_ui(self):
         layout = QVBoxLayout(self)
@@ -594,6 +601,70 @@ class DataDashboardWindow(QDialog):
         header.setStyleSheet("color: #9CDCFE; font-size: 18px; font-weight: bold; padding: 10px;")
         header.setAlignment(Qt.AlignCenter)
         layout.addWidget(header)
+        
+        # 日期选择器和筛选器
+        filter_layout = QHBoxLayout()
+        filter_layout.setContentsMargins(20, 10, 20, 10)
+        
+        # 日期选择
+        filter_layout.addWidget(QLabel("📅 日期:"))
+        self.date_edit = QComboBox()
+        self.date_edit.setEditable(True)
+        self.date_edit.setFixedWidth(150)
+        # 填充最近 7 天
+        for i in range(6, -1, -1):
+            date = (datetime.now() - timedelta(days=i)).strftime('%Y-%m-%d')
+            self.date_edit.addItem(date)
+        self.date_edit.setCurrentText(self.selected_date)
+        self.date_edit.currentTextChanged.connect(self.on_date_changed)
+        filter_layout.addWidget(self.date_edit)
+        
+        # 前一天
+        btn_prev = QPushButton("◀ 前一天")
+        btn_prev.clicked.connect(self.go_to_prev_day)
+        filter_layout.addWidget(btn_prev)
+        
+        # 后一天
+        btn_next = QPushButton("后一天 ▶")
+        btn_next.clicked.connect(self.go_to_next_day)
+        filter_layout.addWidget(btn_next)
+        
+        filter_layout.addSpacing(30)
+        
+        # 应用筛选
+        filter_layout.addWidget(QLabel("应用:"))
+        self.combo_app = QComboBox()
+        self.combo_app.addItem("全部")
+        self.combo_app.addItems(get_unique_apps())
+        self.combo_app.setFixedWidth(150)
+        self.combo_app.currentTextChanged.connect(self.on_filter_changed)
+        filter_layout.addWidget(self.combo_app)
+        
+        # 项目筛选
+        filter_layout.addWidget(QLabel("项目:"))
+        self.combo_project = QComboBox()
+        self.combo_project.addItem("全部")
+        self.combo_project.addItems(get_unique_projects())
+        self.combo_project.setFixedWidth(150)
+        self.combo_project.currentTextChanged.connect(self.on_filter_changed)
+        filter_layout.addWidget(self.combo_project)
+        
+        # 时长阈值筛选
+        filter_layout.addWidget(QLabel("时长:"))
+        self.combo_threshold = QComboBox()
+        self.combo_threshold.addItems(["≥0 分钟", "≥1 分钟", "≥5 分钟", "≥10 分钟", "≥30 分钟"])
+        self.combo_threshold.setFixedWidth(100)
+        self.combo_threshold.currentTextChanged.connect(self.on_filter_changed)
+        filter_layout.addWidget(self.combo_threshold)
+        
+        filter_layout.addStretch()
+        
+        # 刷新按钮
+        btn_refresh = QPushButton("🔄 刷新")
+        btn_refresh.clicked.connect(self.refresh_timeline)
+        filter_layout.addWidget(btn_refresh)
+        
+        layout.addLayout(filter_layout)
         
         # 图表容器（左右分栏）
         chart_layout = QHBoxLayout()
@@ -608,6 +679,30 @@ class DataDashboardWindow(QDialog):
         chart_layout.addWidget(self.canvas_pie, stretch=2) # 饼图占 2 份宽
         
         layout.addLayout(chart_layout)
+        
+        # 分隔线
+        separator = QFrame()
+        separator.setFrameShape(QFrame.HLine)
+        separator.setStyleSheet("background-color: #333333;")
+        separator.setFixedHeight(2)
+        layout.addWidget(separator)
+        
+        # 时间轴区域
+        timeline_label = QLabel(f"📅 {self.selected_date} 时间轴 (滚轮缩放 / 拖拽平移)")
+        timeline_label.setStyleSheet("color: #9CDCFE; font-size: 14px; font-weight: bold; padding: 10px 20px;")
+        layout.addWidget(timeline_label)
+        
+        # 时间轴组件（使用主界面样式）
+        self.timeline = TimelineWidget()
+        self.timeline.setFixedHeight(120)  # 增加高度以便显示
+        self.timeline.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        layout.addWidget(self.timeline)
+        
+        # 统计信息
+        self.lbl_timeline_stats = QLabel("")
+        self.lbl_timeline_stats.setStyleSheet("color: #888888; font-size: 12px; padding: 5px 20px;")
+        self.lbl_timeline_stats.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self.lbl_timeline_stats)
         
         # 底部关闭按钮
         btn_close = QPushButton("关闭大屏")
@@ -718,6 +813,164 @@ class DataDashboardWindow(QDialog):
         # 刷新画布显示
         self.canvas_bar.draw()
         self.canvas_pie.draw()
+    
+    def on_date_changed(self, date):
+        """日期改变"""
+        try:
+            # 验证日期格式
+            datetime.strptime(date, '%Y-%m-%d')
+            self.selected_date = date
+            self.refresh_timeline()
+        except ValueError:
+            QMessageBox.warning(self, "日期格式错误", "请使用 YYYY-MM-DD 格式")
+    
+    def go_to_prev_day(self):
+        """前一天"""
+        current = datetime.strptime(self.selected_date, '%Y-%m-%d')
+        prev = current - timedelta(days=1)
+        self.selected_date = prev.strftime('%Y-%m-%d')
+        self.date_edit.setCurrentText(self.selected_date)
+        self.refresh_timeline()
+    
+    def go_to_next_day(self):
+        """后一天"""
+        current = datetime.strptime(self.selected_date, '%Y-%m-%d')
+        next_day = current + timedelta(days=1)
+        
+        # 不允许选择未来日期
+        if next_day > datetime.now():
+            QMessageBox.information(self, "提示", "不能选择未来日期")
+            return
+        
+        self.selected_date = next_day.strftime('%Y-%m-%d')
+        self.date_edit.setCurrentText(self.selected_date)
+        self.refresh_timeline()
+    
+    def on_filter_changed(self):
+        """筛选条件改变"""
+        self.refresh_timeline()
+    
+    def refresh_timeline(self):
+        """刷新时间轴"""
+        app_filter = self.combo_app.currentText()
+        if app_filter == "全部":
+            app_filter = None
+        
+        project_filter = self.combo_project.currentText()
+        if project_filter == "全部":
+            project_filter = None
+        
+        # 获取时长阈值（分钟）
+        threshold_minutes = self.combo_threshold.currentText().replace("分钟", "").replace("≥", "").strip()
+        try:
+            threshold_seconds = int(threshold_minutes) * 60
+        except:
+            threshold_seconds = 0
+        
+        # 加载时间轴数据
+        self.load_timeline_data(self.selected_date, app_filter, project_filter, threshold_seconds)
+    
+    def load_timeline_data(self, date, app_filter=None, project_filter=None, threshold_seconds=0):
+        """
+        加载指定日期的时间轴数据（直接查询原始记录并聚合）
+        """
+        from datetime import datetime as dt_module
+        
+        conn = get_connection()
+        
+        # 计算日期范围
+        today_start = f"{date} 00:00:00"
+        tomorrow_start = f"{dt_module.strptime(date, '%Y-%m-%d').replace(hour=0, minute=0, second=0) + timedelta(days=1)}"
+        
+        # 查询原始记录
+        query = """
+            SELECT timestamp, duration, app_name, file_path 
+            FROM activity_log 
+            WHERE timestamp >= ? AND timestamp < ?
+        """
+        params = [today_start, tomorrow_start]
+        
+        # 添加筛选
+        if app_filter and app_filter != '全部':
+            query += " AND app_name = ?"
+            params.append(app_filter)
+        
+        if project_filter and project_filter != '全部':
+            if project_filter == '未分配':
+                query += """ AND file_path NOT IN (
+                    SELECT file_path FROM file_assignment WHERE project_id IS NOT NULL
+                )"""
+            else:
+                query += """ AND file_path IN (
+                    SELECT file_path FROM file_assignment fa
+                    JOIN projects p ON fa.project_id = p.id
+                    WHERE p.project_name = ?
+                )"""
+                params.append(project_filter)
+        
+        query += " ORDER BY timestamp ASC"
+        
+        logs = conn.execute(query, params).fetchall()
+        conn.close()
+        
+        print(f"🔍 查询 {date} 的数据：找到 {len(logs)} 条原始记录")
+        
+        if not logs:
+            self.timeline.update_data([])
+            self.lbl_timeline_stats.setText("📭 当天暂无数据")
+            return
+        
+        # 在 Python 中聚合连续记录（和主界面一样的逻辑）
+        blocks = []
+        current_block = None
+        
+        for timestamp_str, duration, app, fpath in logs:
+            try:
+                dtime = dt_module.fromisoformat(timestamp_str.split('.')[0])
+                start_sec = dtime.hour * 3600 + dtime.minute * 60 + dtime.second
+                end_sec = start_sec + duration
+                
+                if current_block is None:
+                    current_block = [start_sec, end_sec, app, fpath, False]
+                else:
+                    # 如果紧挨着且应用相同，聚合
+                    if start_sec - current_block[1] <= 60 and app == current_block[2]:
+                        current_block[1] = end_sec
+                    else:
+                        # 添加前一个块
+                        blocks.append(current_block)
+                        
+                        # 添加闲置块（时间间隔>60 秒）
+                        if start_sec - current_block[1] > 60:
+                            blocks.append([current_block[1], start_sec, "Idle", "", True])
+                        
+                        current_block = [start_sec, end_sec, app, fpath, False]
+            except Exception as e:
+                print(f"  ❌ 解析失败：{e}")
+                continue
+        
+        if current_block:
+            blocks.append(current_block)
+        
+        # 应用时长阈值过滤
+        if threshold_seconds > 0:
+            blocks = [b for b in blocks if (b[1] - b[0]) >= threshold_seconds]
+        
+        print(f"📊 聚合后 {len(blocks)} 个时间块")
+        
+        # 更新的时间轴
+        self.timeline.update_data(blocks)
+        
+        # 更新统计信息
+        total_duration = sum(b[1] - b[0] for b in blocks if not b[4])  # 排除闲置
+        total_apps = len(set(b[2] for b in blocks if not b[4] and b[2] != "Idle"))
+        
+        hours = total_duration // 3600
+        minutes = (total_duration % 3600) // 60
+        
+        self.lbl_timeline_stats.setText(
+            f"总计：{hours}小时{minutes}分钟 | {total_apps} 个应用 | {len(blocks)} 条记录"
+        )
 
 
 # ================= 极客交互式时间轴组件 (可缩放/拖拽) =================
@@ -797,11 +1050,74 @@ class TimelineWidget(QWidget):
         self.update()
 
     # --- 交互 2：按住左键拖拽平移 (Pan) ---
+    # --- 交互 3：双击显示详情 ---
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
+            # 检测是否是双击
+            if event.type() == Qt.MouseButtonDblClick:
+                # 显示详情
+                self.show_block_details(event.position().x())
+                return
+            
             self.is_dragging = True
             self.last_mouse_x = event.position().x()
             self.setCursor(Qt.ClosedHandCursor) # 鼠标变成小抓手
+    
+    def show_block_details(self, x):
+        """显示点击位置的时间块详情"""
+        width = self.width()
+        click_sec = self.pixel_to_time(x, width)
+        
+        # 查找点击位置的时间块
+        for (start, end, app, fpath, is_idle) in self.blocks:
+            if start <= click_sec <= end:
+                # 找到匹配的块
+                start_str = f"{int(start//3600):02d}:{int((start%3600)//60):02d}"
+                end_str = f"{int(end//3600):02d}:{int((end%3600)//60):02d}"
+                duration_sec = int(end - start)
+                duration_str = format_duration(duration_sec)
+                
+                # 创建详情对话框
+                from PySide6.QtWidgets import QDialog, QVBoxLayout, QLabel, QPushButton, QTextEdit
+                dialog = QDialog(self.window())
+                dialog.setWindowTitle("⏱️ 时间使用详情")
+                dialog.setMinimumWidth(500)
+                dialog.setMinimumHeight(300)
+                
+                layout = QVBoxLayout(dialog)
+                
+                # 标题
+                title = QLabel(f"<h3>📊 时间使用详情</h3>")
+                layout.addWidget(title)
+                
+                # 应用信息
+                if is_idle:
+                    info = QLabel(f"<b>类型：</b> 💤 闲置/休息")
+                else:
+                    info = QLabel(f"""
+                        <b>应用：</b> {app}<br>
+                        <b>文件：</b> {fpath if fpath else '未知'}<br>
+                        <b>时间：</b> {start_str} - {end_str}<br>
+                        <b>时长：</b> {duration_str}
+                    """)
+                info.setStyleSheet("color: #D4D4D4; font-size: 13px; padding: 10px;")
+                layout.addWidget(info)
+                
+                # 关闭按钮
+                btn_close = QPushButton("关闭")
+                btn_close.clicked.connect(dialog.accept)
+                btn_close.setFixedWidth(100)
+                btn_layout = QHBoxLayout()
+                btn_layout.addStretch()
+                btn_layout.addWidget(btn_close)
+                btn_layout.addStretch()
+                layout.addLayout(btn_layout)
+                
+                dialog.exec()
+                return
+        
+        # 没有找到匹配的块
+        QMessageBox.information(self.window(), "提示", "点击位置没有活动时间块")
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.LeftButton:
