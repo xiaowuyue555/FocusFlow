@@ -89,12 +89,17 @@ class SystemTrayManager:
         self.action_restart.triggered.connect(self.restart_app)
         self.tray_menu.addAction(self.action_restart)
         
+        # 菜单项 4：退出程序
+        self.action_quit = QAction("退出程序", self.dashboard)
+        self.action_quit.triggered.connect(self.quit_app)
+        self.tray_menu.addAction(self.action_quit)
+        
         self.tray_icon.setContextMenu(self.tray_menu)
         
         # 显示托盘图标
         self.tray_icon.show()
         
-        # 更新菜单文本
+        # 更新菜单文本（根据实际窗口状态）
         self.update_menu_texts()
         
         print("✅ 系统托盘已初始化")
@@ -191,6 +196,20 @@ class SystemTrayManager:
         if self.tray_icon:
             self.tray_icon.hide()
             self.tray_icon = None
+    
+    def quit_app(self):
+        """退出程序"""
+        # 保存悬浮窗状态
+        floating = self.dashboard.floating_widget
+        set_config("floating_position_x", str(floating.x()))
+        set_config("floating_position_y", str(floating.y()))
+        set_config("floating_visible", "true" if floating.isVisible() else "false")
+        
+        # 关闭所有窗口
+        self.dashboard.close()
+        
+        # 退出应用
+        QApplication.quit()
 
 class BlacklistDialog(QDialog):
     def __init__(self, parent=None):
@@ -901,7 +920,52 @@ class DashboardV2(QMainWindow):
         self.system_tray = SystemTrayManager(self)
         self.system_tray.setup()
         
+        # 【macOS】设置应用不在 Dock 中显示
+        if sys.platform == 'darwin':
+            self._setup_macos_dock_behavior()
+        
+        # 标记是否正在退出
+        self._is_quitting = False
+        
         self.refresh_data()
+        
+        # 窗口显示后，再次更新菜单文本确保状态正确
+        QTimer.singleShot(100, self.system_tray.update_menu_texts)
+    
+    def _setup_macos_dock_behavior(self):
+        """设置 macOS 下 Dock 栏行为"""
+        try:
+            from AppKit import NSApplication, NSApplicationActivationPolicyRegular
+            
+            # 获取 NSApplication 实例
+            app = NSApplication.sharedApplication()
+            
+            # 设置为 regular 模式（默认，会在 Dock 显示）
+            # 后面会在 hideEvent 和 showEvent 中动态切换
+            app.setActivationPolicy_(NSApplicationActivationPolicyRegular)
+            
+            self._macos_app = app
+            print("✅ macOS Dock 动态管理已初始化")
+        except Exception as e:
+            print(f"⚠️ macOS Dock 管理初始化失败：{e}")
+            self._macos_app = None
+    
+    def _update_macos_dock_visibility(self):
+        """根据窗口可见性更新 Dock 图标显示"""
+        if not hasattr(self, '_macos_app') or self._macos_app is None:
+            return
+        
+        try:
+            from AppKit import NSApplicationActivationPolicyRegular, NSApplicationActivationPolicyAccessory
+            
+            if self.isVisible():
+                # 窗口可见 → 在 Dock 显示
+                self._macos_app.setActivationPolicy_(NSApplicationActivationPolicyRegular)
+            else:
+                # 窗口隐藏 → 不在 Dock 显示
+                self._macos_app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
+        except Exception as e:
+            pass  # 静默失败，不影响主功能
         
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh_data)
@@ -2417,18 +2481,59 @@ class DashboardV2(QMainWindow):
         """)
     
     def closeEvent(self, event):
-        """关闭窗口时清理资源"""
-        # 保存悬浮窗状态
-        if hasattr(self, 'floating_widget'):
-            set_config("floating_position_x", str(self.floating_widget.x()))
-            set_config("floating_position_y", str(self.floating_widget.y()))
-            set_config("floating_visible", "true" if self.floating_widget.isVisible() else "false")
-        
-        # 清理系统托盘
-        if hasattr(self, 'system_tray'):
-            self.system_tray.cleanup()
-        
-        event.accept()
+        """关闭窗口时隐藏到托盘而不是真正关闭"""
+        # 如果正在退出，才真正关闭
+        if getattr(self, '_is_quitting', False):
+            # 保存悬浮窗状态
+            if hasattr(self, 'floating_widget'):
+                set_config("floating_position_x", str(self.floating_widget.x()))
+                set_config("floating_position_y", str(self.floating_widget.y()))
+                set_config("floating_visible", "true" if self.floating_widget.isVisible() else "false")
+            
+            # 清理系统托盘
+            if hasattr(self, 'system_tray'):
+                self.system_tray.cleanup()
+            
+            event.accept()
+        else:
+            # 否则隐藏到托盘
+            event.ignore()
+            self.hide()
+            
+            # 保存悬浮窗状态
+            if hasattr(self, 'floating_widget'):
+                set_config("floating_position_x", str(self.floating_widget.x()))
+                set_config("floating_position_y", str(self.floating_widget.y()))
+                set_config("floating_visible", "true" if self.floating_widget.isVisible() else "false")
+            
+            # 更新托盘菜单文本
+            if hasattr(self, 'system_tray'):
+                self.system_tray.update_menu_texts()
+    
+    def changeEvent(self, event):
+        """处理窗口状态变化（最小化等）"""
+        if event.type() == event.Type.WindowStateChange:
+            if self.windowState() & Qt.WindowMinimized:
+                # 最小化时隐藏到托盘
+                self.hide()
+                # 更新托盘菜单文本
+                if hasattr(self, 'system_tray'):
+                    self.system_tray.update_menu_texts()
+        super().changeEvent(event)
+    
+    def hideEvent(self, event):
+        """窗口隐藏事件"""
+        # 更新 Dock 显示状态
+        if sys.platform == 'darwin':
+            self._update_macos_dock_visibility()
+        super().hideEvent(event)
+    
+    def showEvent(self, event):
+        """窗口显示事件"""
+        # 更新 Dock 显示状态
+        if sys.platform == 'darwin':
+            self._update_macos_dock_visibility()
+        super().showEvent(event)
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
