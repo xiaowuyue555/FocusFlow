@@ -1198,3 +1198,78 @@ def get_unique_projects():
     projects.append('未分配')
     
     return projects
+
+
+def get_projects_with_subprojects():
+    """
+    获取项目/子项目层级结构
+    
+    Returns:
+        list of tuples: [
+            ('project_1', '项目 1'),  # 父项目
+            ('project_1.sub_1', '  ├─ 子项目 1'),  # 子项目
+            ('project_1.sub_2', '  ├─ 子项目 2'),
+            ('project_2', '项目 2'),
+            ('未分配', '未分配'),
+        ]
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    # 查询所有项目，包括 parent_id
+    cursor.execute("""
+        SELECT id, project_name, parent_id 
+        FROM projects 
+        ORDER BY parent_id, project_name ASC
+    """)
+    rows = cursor.fetchall()
+    
+    conn.close()
+    
+    # 构建项目树
+    projects_dict = {}
+    for row in rows:
+        project_id, project_name, parent_id = row
+        if project_id not in projects_dict:
+            projects_dict[project_id] = {
+                'name': project_name,
+                'parent_id': parent_id,
+                'children': []
+            }
+        
+        if parent_id is not None:
+            # 这是子项目，添加到父项目的 children 中
+            if parent_id in projects_dict:
+                projects_dict[parent_id]['children'].append(project_id)
+            else:
+                projects_dict[parent_id] = {'name': '', 'parent_id': None, 'children': [project_id]}
+    
+    # 收集结果
+    result = []
+    
+    # 先添加父项目
+    parent_projects = [(pid, pdata) for pid, pdata in projects_dict.items() if pdata['parent_id'] is None]
+    parent_projects.sort(key=lambda x: x[1]['name'])
+    
+    for project_id, project_data in parent_projects:
+        project_name = project_data['name']
+        if not project_name:  # 跳过空名称
+            continue
+        
+        # 添加父项目
+        result.append((f"project_{project_id}", project_name))
+        
+        # 添加子项目
+        children_ids = project_data['children']
+        if children_ids:
+            # 按名称排序子项目
+            children = [(cid, projects_dict[cid]['name']) for cid in children_ids if cid in projects_dict]
+            children.sort(key=lambda x: x[1])
+            
+            for child_id, child_name in children:
+                result.append((f"project_{child_id}", f"  ├─ {child_name}"))
+    
+    # 添加"未分配"选项
+    result.append(('未分配', '未分配'))
+    
+    return result

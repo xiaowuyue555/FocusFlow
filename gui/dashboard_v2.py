@@ -29,7 +29,7 @@ from PySide6.QtGui import QStandardItemModel, QStandardItem, QFont, QPainter, QC
 from PySide6.QtCore import Qt, QModelIndex, QTimer, QItemSelectionModel
 from PySide6.QtWidgets import QSystemTrayIcon
 
-from core.database import get_connection, init_db, get_db_path, set_db_path, get_config, set_config, get_date_range
+from core.database import get_connection, init_db, get_db_path, set_db_path, get_config, set_config, get_date_range, get_projects_with_subprojects
 from core.project_tree import (
     load_project_tree, get_project_stats, get_all_projects_flat, 
     get_project_files, create_project, delete_project, 
@@ -891,9 +891,19 @@ class DataDashboardWindow(QDialog):
         # 项目筛选
         filter_layout.addWidget(QLabel("项目:"))
         self.combo_project = QComboBox()
-        self.combo_project.addItem("全部")
-        self.combo_project.addItems(get_unique_projects())
-        self.combo_project.setFixedWidth(150)
+        self.combo_project.addItem("全部", None)  # (显示文本，项目 ID)
+        
+        # 添加项目/子项目层级
+        projects_data = get_projects_with_subprojects()
+        for project_key, project_name in projects_data:
+            if project_key == '未分配':
+                self.combo_project.addItem(project_name, '未分配')
+            else:
+                # 提取项目 ID
+                project_id = int(project_key.replace('project_', ''))
+                self.combo_project.addItem(project_name, project_id)
+        
+        self.combo_project.setFixedWidth(200)
         self.combo_project.currentTextChanged.connect(self.on_filter_changed)
         filter_layout.addWidget(self.combo_project)
         
@@ -1322,9 +1332,15 @@ class DataDashboardWindow(QDialog):
         if app_filter == "全部":
             app_filter = None
         
-        project_filter = self.combo_project.currentText()
-        if project_filter == "全部":
+        # 获取项目筛选（使用 userData）
+        project_data = self.combo_project.currentData()
+        if project_data is None:  # "全部"选项
             project_filter = None
+        elif project_data == '未分配':
+            project_filter = '未分配'
+        else:
+            # 使用项目名称作为筛选
+            project_filter = self.combo_project.currentText()
         
         # 获取时长阈值（分钟）
         threshold_minutes = self.combo_threshold.currentText().replace("分钟", "").replace("≥", "").strip()
@@ -3583,7 +3599,14 @@ class DashboardV2(QMainWindow):
         dlg.setWindowTitle("分配记录")
         layout = QVBoxLayout(dlg)
         combo = QComboBox()
-        for p in projects: combo.addItem(p['name'], p['id'])
+        
+        # 添加项目/子项目层级
+        projects_data = get_projects_with_subprojects()
+        for project_key, project_name in projects_data:
+            if project_key != '未分配':
+                project_id = int(project_key.replace('project_', ''))
+                combo.addItem(project_name, project_id)
+        
         layout.addWidget(combo)
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         btns.accepted.connect(dlg.accept)
@@ -3664,8 +3687,12 @@ class DashboardV2(QMainWindow):
         layout.addWidget(QLabel(f"选择目标项目："))
         
         combo = QComboBox()
-        for p in projects:
-            combo.addItem(p['name'], p['id'])
+        # 添加项目/子项目层级
+        projects_data = get_projects_with_subprojects()
+        for project_key, project_name in projects_data:
+            if project_key != '未分配':
+                project_id = int(project_key.replace('project_', ''))
+                combo.addItem(project_name, project_id)
         layout.addWidget(combo)
         
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -3714,8 +3741,12 @@ class DashboardV2(QMainWindow):
         layout.addWidget(QLabel(f"选择目标项目："))
         
         combo = QComboBox()
-        for p in projects:
-            combo.addItem(p['name'], p['id'])
+        # 添加项目/子项目层级
+        projects_data = get_projects_with_subprojects()
+        for project_key, project_name in projects_data:
+            if project_key != '未分配':
+                project_id = int(project_key.replace('project_', ''))
+                combo.addItem(project_name, project_id)
         layout.addWidget(combo)
         
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
