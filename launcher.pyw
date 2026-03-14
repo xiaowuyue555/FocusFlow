@@ -24,6 +24,36 @@ def main():
     
     os.chdir(PROJECT_ROOT)
     
+    # 首次启动检查：确保用户数据目录存在
+    from core.database import ensure_user_data_dir, get_db_path, get_user_data_dir
+    import sqlite3
+    
+    try:
+        # 确保用户数据目录存在
+        user_data_dir = ensure_user_data_dir()
+        
+        # 检查是否是首次启动（数据库不存在）
+        db_path = get_db_path()
+        is_first_run = not os.path.exists(db_path)
+        
+        if is_first_run:
+            # 首次启动，显示欢迎消息
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(
+                0, 
+                f"欢迎使用 FocusFlow！\n\n"
+                f"这是首次启动，程序将在以下位置创建数据库：\n"
+                f"{db_path}\n\n"
+                f"你可以在设置中随时更改数据库位置。",
+                "FocusFlow 欢迎", 
+                64
+            )
+    except Exception as e:
+        # 如果目录创建失败，记录错误但继续（会降级到程序目录）
+        with open(log_file, 'w', encoding='utf-8') as f:
+            f.write(f"用户目录创建警告：{str(e)}\n")
+            f.write("将使用程序目录存储数据\n\n")
+    
     # 检查虚拟环境
     venv_python = os.path.join(PROJECT_ROOT, "venv", "Scripts", "python.exe")
     if os.path.exists(venv_python):
