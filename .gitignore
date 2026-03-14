@@ -2,24 +2,58 @@
 __pycache__/
 *.py[cod]
 *$py.class
+*.pyc
+*.so
 
 # Virtual Environment
 venv/
 .venv/
 env/
+ENV/
 
 # Environment variables
 .env
 
 # macOS
 .DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
 
 # IDE
 .vscode/
 .idea/
+*.swp
+*.swo
+*~
 
 # Logs
 *.log
+logs/
 
-data/
-*.pyc
+# Database (optional - include if you want to track schema only)
+# data/*.db
+data/tracker.db-shm
+data/tracker.db-wal
+
+# Build artifacts
+build/
+dist/
+*.spec
+*.egg-info/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Temporary files
+*.tmp
+*.bak
+*.temp

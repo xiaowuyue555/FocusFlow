@@ -1,84 +1,258 @@
+# FocusFlow - 专业工时追踪与项目管理工具
 
-# FocusFlow 项目开发文档
+[![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
+[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey.svg)](https://github.com)
+[![License](https://img.shields.io/badge/license-MIT-green.svg)](https://github.com)
 
-## 1. 项目概述
-**FocusFlow** 是一个面向专业动画师/剪辑师的跨平台生产力工时统计工具。它能够在后台静默记录用户在 After Effects、Premiere Pro 等软件上的实际工作时长，并根据文件路径自动归档至用户自定义的"项目"中，最终生成可视化报表。
+**FocusFlow** 是一款面向专业动画师/剪辑师的跨平台生产力工时统计工具。它能够在后台静默记录用户在 After Effects、Premiere Pro 等软件上的实际工作时长，并根据文件路径自动归档至用户自定义的项目中，最终生成可视化报表。
 
-## 2. 核心架构 (Directory Structure)
-本项目采用分层架构，确保逻辑解耦：
+## ✨ 核心特性
 
-*   `FocusFlow/`
-    *   `core/`：核心引擎与数据库管理。
-        *   `database.py`：负责 SQLite 连接、初始化表结构（`activity_log`、`projects`、`project_map`、`file_assignment`、`runtime_status` 等）。
-        *   `project_tree.py`：项目树形数据结构，支持多级子项目管理。
-    *   `modules/`：功能模块与逻辑规则。
-        *   `app_detector.py`：多软件识别引擎，通过窗口标题提取 `.aep` 或 `.prproj` 文件路径。
-        *   `rule_engine.py`：待扩展的智能匹配逻辑（当前集成在 GUI 中）。
-    *   `gui/`：前端仪表盘。
-        *   `dashboard.py`：使用 `customtkinter` 构建的 GUI，负责数据报表展示、项目规则配置与多级子项目管理。
-        *   `floating_window.py`：悬浮窗组件，实时显示当前追踪项目与工时。
-    *   `data/`：数据存储。
-        *   `tracker.db`：SQLite 数据库。
-    *   `service_daemon.py`：后台采集守护进程，负责循环采集并写入日志。
-    *   `requirements.txt`：项目依赖（包含 `customtkinter`, `psutil`, `pandas`, `pyobjc` 等）。
+- ⏱️ **自动追踪** - 后台静默记录，无需手动操作
+- 🎯 **智能分配** - 基于路径关键词自动归类到项目
+- 🌳 **多级项目** - 支持无限层级的项目树结构
+- 📊 **实时统计** - 可视化展示工时投入
+- 💻 **跨平台** - 支持 macOS、Linux、Windows
+- 🗄️ **数据归档** - 自动归档历史数据，保持高性能
+- 🔔 **系统托盘** - 便捷的系统托盘菜单控制
 
-## 3. 技术栈
-*   **语言**: Python 3.12
-*   **界面库**: `customtkinter` (现代化 UI)
-*   **数据库**: `sqlite3` (支持自关联的多级项目结构)
-*   **数据分析**: `pandas` (用于高效聚合工时)
-*   **系统调用**: `pyobjc` (macOS 系统 API 交互), `psutil` (进程管理)
+## 🚀 快速开始
 
-## 4. 已实现功能
-1.  **静默采集**: 后台实时监听 AE 和 PR 的活跃状态，利用系统 API 获取当前活动工程的绝对路径。
-2.  **权限处理**: 成功绕过 macOS 的屏幕录制与辅助功能权限拦截，实现稳定读取。
-3.  **智能归档**: GUI 支持自定义"路径关键词"与"项目名称"映射，实现工时按项目归类。
-4.  **仪表盘系统**: 一键刷新今日报表，文字化展示当前项目工时，支持动态添加项目规则。
-5.  **工程化路径优化**: 所有数据存储与读取均基于绝对路径，避免了工程重名引起的统计混乱。
-6.  **多级子项目支持**: 
-    *   支持无限层级的项目树结构
-    *   通过 `parent_id` 实现父子项目关联
-    *   GUI 以树形结构展示项目层级
-    *   支持新建子项目、重命名、归档、删除等操作
-7.  **实时追踪**:
-    *   后台采集频率：1秒
-    *   GUI 刷新频率：1秒
-    *   悬浮窗更新频率：1秒
-    *   实时累加计时，无延迟
-8.  **悬浮窗组件**: 
-    *   可拖动的悬浮窗显示当前追踪项目
-    *   实时显示应用名称、状态、空闲时间
-    *   显示累计工时
+### 安装依赖
 
-## 5. 当前统计逻辑
-*   **闲置判定**: 超过 30 秒无键鼠操作则暂停计时。
-*   **采集周期**: 以 1 秒为周期进行心跳记录，写入 `activity_log` 表。
-*   **归档**: 报表生成时，通过 `pandas` 对路径进行模糊匹配，将命中规则的路径合并统计。
-*   **项目匹配**: 
-    *   优先使用 `file_assignment` 表的精确匹配
-    *   其次使用 `project_map` 的路径关键词匹配
-    *   最后使用项目树的层级结构
+```bash
+# 克隆项目
+cd /path/to/FocusFlow
 
-## 6. 数据库表结构
-*   `activity_log`: 记录每次活动的时间戳、应用、文件路径和持续时间
-*   `projects`: 项目表，支持 `parent_id` 实现多级子项目
-*   `project_map`: 路径关键词与项目名称的映射规则
-*   `file_assignment`: 文件路径与项目的精确关联
-*   `project_archive`: 项目归档状态
-*   `runtime_status`: 运行时状态（应用、文件路径、空闲时间等）
+# 创建虚拟环境
+python -m venv venv
 
-## 7. 未来开发路线 (TODO List)
-1.  **自动化部署**: 将 `service_daemon.py` 封装为 macOS 的 `LaunchAgent` (.plist) 实现开机自启。
-2.  **报表强化**: 增加"导出至 Excel/CSV"功能，支持自定义时间范围（周报/月报）。
-3.  **图表可视化**: 接入 `matplotlib` 或 `plotly` 实现饼图/柱状图展示。
-4.  **黑/白名单机制**: 提供配置页面屏蔽非生产力软件（如浏览器、聊天工具）。
-5.  **渲染检测**: 优化采集逻辑，实现"即使闲置，只要处于渲染状态仍计费"的功能。
-6.  **Windows 适配**: 引入 `win32gui` 和 `win32process` 替换 macOS 的 Quartz API，实现完全的跨平台。
-7.  **项目统计优化**: 实现递归统计子项目的工时汇总到父项目。
-8.  **任务管理**: 支持在项目下创建和管理子任务。
-9.  **时间段分析**: 支持按时间段筛选和分析工作记录。
+# 激活虚拟环境
+# macOS/Linux:
+source venv/bin/activate
+# Windows:
+venv\Scripts\activate
+
+# 安装依赖
+pip install -r requirements.txt
+```
+
+### 启动程序
+
+```bash
+# macOS/Linux
+# 方法 1：直接执行脚本（推荐）
+bash scripts/start.sh
+
+# 方法 2：赋予执行权限后执行
+chmod +x scripts/start.sh
+./scripts/start.sh
+
+# Windows
+python scripts\start.bat
+```
+
+启动脚本会自动：
+1. 检查并启动后台采集服务
+2. 启动 GUI 界面
+3. 自动处理多实例共享服务
+
+### 停止程序
+
+1. **关闭 GUI** - 通过系统托盘菜单选择"退出程序"
+2. **停止后台服务**（可选）：
+   ```bash
+   # macOS/Linux
+   pkill -f "service_daemon.py"
+   
+   # Windows
+   taskkill /F /FI "WINDOWTITLE eq *service_daemon.py*"
+   ```
+
+## 📁 项目结构
+
+```
+FocusFlow/
+├── core/                      # 核心模块
+│   ├── database.py           # 数据库管理、配置管理
+│   ├── project_tree.py       # 项目树形结构
+│   └── export.py             # 数据导出功能
+├── modules/                   # 功能模块
+│   ├── app_detector.py       # 活动窗口检测
+│   └── rule_engine.py        # 规则引擎
+├── gui/                       # 图形界面
+│   ├── dashboard_v2.py       # 主界面 (PySide6)
+│   ├── data_management.py    # 数据管理对话框
+│   └── time_axis.py          # 时间轴组件
+├── service_daemon.py         # 后台采集服务
+├── scripts/                   # 启动脚本
+│   ├── start.sh              # macOS/Linux
+│   └── start.bat             # Windows
+├── tests/                     # 测试文件
+│   ├── test_archive.py       # 归档功能测试
+│   ├── test_performance.py   # 性能测试
+│   └── test_archive_tool.py  # 归档工具测试
+├── docs/                      # 文档目录
+│   ├── 启动说明.md
+│   ├── 功能说明/
+│   │   ├── 多级子项目.md
+│   │   └── 数据归档.md
+│   └── 开发指南/
+│       └── 项目交接说明.md
+├── data/                      # 数据文件
+│   └── tracker.db            # SQLite 数据库
+├── requirements.txt           # 依赖列表
+└── README.md                  # 项目说明
+```
+
+## 🛠️ 技术栈
+
+- **语言**: Python 3.12+
+- **GUI 框架**: PySide6 (Qt for Python)
+- **数据库**: SQLite3
+- **数据处理**: Pandas, Matplotlib
+- **系统监控**: 
+  - macOS: Quartz (Core Graphics)
+  - Windows: psutil (计划)
+
+## 📋 核心功能
+
+### 1. 后台采集引擎
+
+**位置**: `service_daemon.py`
+
+- 每秒检测当前活跃窗口（应用名称、文件路径）
+- 检测系统闲置状态（默认 30 秒无操作）
+- 将活动记录写入数据库
+- 独立运行，不受 GUI 影响
+
+### 2. GUI 主界面
+
+**位置**: `gui/dashboard_v2.py`
+
+- 项目树形结构展示与管理
+- 实时状态追踪（当前应用、文件、项目）
+- 时间统计面板（累积、今日、本次连续）
+- 数据可视化（柱状图、饼图）
+- 系统托盘集成
+
+### 3. 项目管理系统
+
+- **多级子项目**: 支持无限层级父子关系
+- **智能分配**: 路径关键词自动匹配
+- **手动分配**: 精确绑定文件到项目
+- **项目归档**: 叶子节点归档/恢复
+
+### 4. 数据归档
+
+- 自动归档上月数据（每月 1 号）
+- 主表保留最近 30 天数据
+- 智能查询（自动从主表和归档表获取）
+- 保持数据库高性能
+
+## 📖 详细文档
+
+- **[启动说明](docs/启动说明.md)** - 详细的启动和故障排查指南
+- **[多级子项目功能](docs/功能说明/多级子项目.md)** - 项目树使用指南
+- **[数据归档使用指南](docs/功能说明/数据归档.md)** - 归档功能详解
+- **[项目交接说明](docs/开发指南/项目交接说明.md)** - 完整的开发文档
+
+## 🧪 测试
+
+```bash
+# 运行归档功能测试
+python tests/test_archive.py
+
+# 运行性能测试
+python tests/test_performance.py
+
+# 运行交互式测试工具
+python tests/test_archive_tool.py
+```
+
+## ⚙️ 配置说明
+
+### 环境变量
+
+| 变量名 | 说明 | 默认值 |
+|--------|------|--------|
+| `FOCUSFLOW_INTERVAL_SECONDS` | 采集间隔（秒） | 1 |
+| `FOCUSFLOW_DEBUG` | 调试模式 | 0 |
+| `FOCUSFLOW_IDLE_SOURCE` | 闲置检测源 | combined |
+| `FOCUSFLOW_IDLE_MODE` | 闲置检测模式 | strict |
+
+### 系统配置（数据库）
+
+配置存储在 `system_config` 表：
+
+- `floating_position_x/y`: 悬浮窗位置
+- `floating_visible`: 悬浮窗可见性
+- `idle_threshold`: 闲置阈值（秒）
+
+## 🔧 开发指南
+
+### 代码风格
+
+- 遵循 PEP 8 规范
+- 使用类型注解
+- 函数添加文档字符串
+- 关键逻辑添加注释
+
+### 提交规范
+
+```
+feat: 新功能
+fix: 修复 bug
+docs: 文档更新
+refactor: 代码重构
+test: 测试相关
+chore: 构建/工具相关
+```
+
+## 📅 开发路线
+
+### 已完成
+- ✅ 静默采集与智能归档
+- ✅ 多级子项目支持
+- ✅ 实时追踪与悬浮窗
+- ✅ 数据归档功能
+- ✅ 系统托盘集成
+
+### 计划中
+- 🔄 Windows 兼容性支持
+- 📦 PyInstaller 打包
+- 📊 报表导出（CSV/Excel）
+- 🎨 图表可视化增强
+- ⚙️ 黑/白名单机制
+- 🚀 开机自启（LaunchAgent/注册表）
+- 🎬 渲染状态检测
+
+## ❓ 常见问题
+
+### Q: 后台服务无法启动
+**A**: 检查虚拟环境是否激活，依赖是否安装，终端是否有权限。
+
+### Q: GUI 界面卡顿
+**A**: 数据量过大时建议运行数据归档，保持主表轻量。
+
+### Q: 项目匹配不准确
+**A**: 检查 `project_map` 规则设置，确保关键词唯一性。
+
+### Q: 归档后数据会丢失吗？
+**A**: 不会！数据只是从主表移动到归档表，查询完全透明。
+
+## 🤝 贡献
+
+欢迎提交 Issue 和 Pull Request！
+
+## 📄 许可证
+
+MIT License
 
 ---
 
-**给后续开发者的说明：**
-本项目的数据库文件位于 `data/tracker.db`，核心逻辑在 `core/` 和 `modules/` 目录下。任何修改请务必保持采集器 (`service_daemon.py`) 的轻量级，避免阻塞主循环。
+**最后更新**: 2026-03-14  
+**版本**: v2.0  
+**维护者**: FocusFlow Team
+
+**给开发者的说明**: 数据库位于 `data/tracker.db`，核心逻辑在 `core/` 和 `modules/` 目录下。请保持采集器 (`service_daemon.py`) 轻量级，避免阻塞主循环。
