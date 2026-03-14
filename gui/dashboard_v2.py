@@ -23,13 +23,13 @@ from PySide6.QtWidgets import (
     QSplitter, QTreeView, QHeaderView, QLabel, QPushButton, QMenu,
     QAbstractItemView, QDialog, QComboBox, QDialogButtonBox, QMessageBox, 
     QInputDialog, QSpinBox, QFormLayout, QGroupBox, QCheckBox, QListWidget, QListWidgetItem,QFileDialog, QFrame, QSizePolicy, QScrollArea,
-    QTableWidget, QTableWidgetItem, QHeaderView, QTabWidget
+    QTableWidget, QTableWidgetItem, QHeaderView, QTabWidget, QDateEdit
 )
 from PySide6.QtGui import QStandardItemModel, QStandardItem, QFont, QPainter, QColor, QPen, QBrush, QIcon, QAction, QPixmap
 from PySide6.QtCore import Qt, QModelIndex, QTimer, QItemSelectionModel
 from PySide6.QtWidgets import QSystemTrayIcon
 
-from core.database import get_connection, init_db, get_db_path, set_db_path, get_config, set_config, get_date_range, get_projects_with_subprojects
+from core.database import get_connection, init_db, get_db_path, set_db_path, get_config, set_config, get_date_range, get_projects_with_subprojects, get_project_tree, aggregate_project_timeline, build_project_timeline_tree
 from core.project_tree import (
     load_project_tree, get_project_stats, get_all_projects_flat, 
     get_project_files, create_project, delete_project, 
@@ -590,8 +590,41 @@ class SettingsDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("系统设置")
-        self.setMinimumWidth(350)
+        self.setMinimumWidth(400)
         layout = QVBoxLayout(self)
+        
+        # ========== 主题设置 ==========
+        group_theme = QGroupBox("界面主题")
+        theme_layout = QVBoxLayout(group_theme)
+        
+        # 获取当前主题设置
+        self.current_theme = get_config("app_theme", "dark")
+        
+        # 主题切换按钮组
+        theme_button_layout = QHBoxLayout()
+        
+        self.btn_dark_theme = QPushButton("🌙 深色模式")
+        self.btn_dark_theme.setCheckable(True)
+        self.btn_dark_theme.setChecked(self.current_theme == "dark")
+        self.btn_dark_theme.clicked.connect(lambda: self.set_theme("dark"))
+        theme_button_layout.addWidget(self.btn_dark_theme)
+        
+        self.btn_light_theme = QPushButton("☀️ 浅色模式")
+        self.btn_light_theme.setCheckable(True)
+        self.btn_light_theme.setChecked(self.current_theme == "light")
+        self.btn_light_theme.clicked.connect(lambda: self.set_theme("light"))
+        theme_button_layout.addWidget(self.btn_light_theme)
+        
+        theme_layout.addLayout(theme_button_layout)
+        
+        # 提示标签
+        self.lbl_theme_hint = QLabel("💡 提示：切换主题后需要重启应用才能完全生效")
+        self.lbl_theme_hint.setStyleSheet("color: #888888; font-size: 11px; padding: 5px;")
+        theme_layout.addWidget(self.lbl_theme_hint)
+        
+        layout.addWidget(group_theme)
+        
+        # ========== 后台采集设置 ==========
         group_gather = QGroupBox("后台采集设置")
         form = QFormLayout(group_gather)
         self.spin_idle = QSpinBox()
@@ -602,6 +635,8 @@ class SettingsDialog(QDialog):
         row = conn.execute("SELECT value FROM system_config WHERE key='idle_threshold'").fetchone()
         if row: self.spin_idle.setValue(int(row[0]))
         layout.addWidget(group_gather)
+        
+        # ========== 危险操作 ==========
         group_danger = QGroupBox("危险操作")
         v_danger = QVBoxLayout(group_danger)
         btn_clear_log = QPushButton("🗑️ 清空所有工时记录 (保留项目)")
@@ -613,11 +648,27 @@ class SettingsDialog(QDialog):
         btn_factory.clicked.connect(self.factory_reset)
         v_danger.addWidget(btn_factory)
         layout.addWidget(group_danger)
+        
+        # ========== 按钮 ==========
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.save_settings)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+    
+    def set_theme(self, theme):
+        """设置主题"""
+        self.current_theme = theme
+        if theme == "dark":
+            self.btn_dark_theme.setChecked(True)
+            self.btn_light_theme.setChecked(False)
+        else:
+            self.btn_dark_theme.setChecked(False)
+            self.btn_light_theme.setChecked(True)
     def save_settings(self):
+        # 保存主题设置
+        set_config("app_theme", self.current_theme)
+        
+        # 保存空闲阈值设置
         conn = get_connection()
         conn.execute("INSERT OR REPLACE INTO system_config (key, value) VALUES ('idle_threshold', ?)", (str(self.spin_idle.value()),))
         conn.commit()
@@ -817,9 +868,12 @@ class FloatingWidget(QWidget):
 class DataDashboardWindow(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("📊 生产力数据大屏 (本周洞察)")
+        self.setWindowTitle("生产力数据大屏 (本周洞察)")
         self.resize(1200, 800)  # 加宽以容纳时间轴
         self.setMinimumSize(900, 600)
+        
+        # 读取配置的主题设置
+        self.is_dark_mode = get_config("app_theme", "dark") == "dark"
         
         # 强制 Matplotlib 使用 Mac 系统自带的中文字体（防止中文变成小方块）
         import platform
@@ -829,8 +883,11 @@ class DataDashboardWindow(QDialog):
             plt.rcParams['font.sans-serif'] = ['Microsoft YaHei']
         plt.rcParams['axes.unicode_minus'] = False # 正常显示负号
         
-        # 采用深色酷炫主题
-        plt.style.use('dark_background')
+        # 根据主题选择 Matplotlib 样式
+        if self.is_dark_mode:
+            plt.style.use('dark_background')
+        else:
+            plt.style.use('default')
         
         # 默认日期为今天
         self.selected_date = datetime.now().strftime('%Y-%m-%d')
@@ -844,9 +901,95 @@ class DataDashboardWindow(QDialog):
     def setup_ui(self):
         layout = QVBoxLayout(self)
         
+        # 使用配置的主题设置
+        is_dark_mode = self.is_dark_mode
+        
+        # 根据主题设置背景色
+        if is_dark_mode:
+            # 深色主题样式
+            bg_color = "#1E1E1E"
+            tab_bg = "#2D2D2D"
+            tab_selected = "#1E1E1E"
+            text_color = "#CCCCCC"
+            selected_text = "#9CDCFE"
+            border_color = "#333333"
+            hover_color = "#3E3E3E"
+            header_color = "#9CDCFE"
+        else:
+            # 浅色主题样式
+            bg_color = "#FFFFFF"
+            tab_bg = "#F0F0F0"
+            tab_selected = "#FFFFFF"
+            text_color = "#333333"
+            selected_text = "#0066CC"
+            border_color = "#CCCCCC"
+            hover_color = "#E0E0E0"
+            header_color = "#0066CC"
+        
+        # 设置整体背景
+        self.setStyleSheet(f"""
+            QDialog#DataDashboardWindow {{
+                background-color: {bg_color};
+            }}
+            QLabel {{
+                color: {text_color};
+            }}
+            QComboBox, QDateEdit {{
+                background-color: {tab_bg};
+                color: {text_color};
+                border: 1px solid {border_color};
+                border-radius: 3px;
+                padding: 4px 8px;
+            }}
+            QComboBox::drop-down {{
+                border: none;
+                width: 20px;
+            }}
+            QComboBox::down-arrow {{
+                width: 12px;
+                height: 12px;
+            }}
+            QTabWidget::pane {{
+                border: 1px solid {border_color};
+                background-color: {bg_color};
+            }}
+            QTabBar::tab {{
+                background-color: {tab_bg};
+                color: {text_color};
+                padding: 8px 20px;
+                border: 1px solid {border_color};
+                border-bottom: none;
+                border-top-left-radius: 4px;
+                border-top-right-radius: 4px;
+            }}
+            QTabBar::tab:selected {{
+                background-color: {tab_selected};
+                color: {selected_text};
+                font-weight: bold;
+            }}
+            QTabBar::tab:hover {{
+                background-color: {hover_color};
+            }}
+            QPushButton {{
+                background-color: {tab_bg};
+                color: {text_color};
+                border: 1px solid {border_color};
+                border-radius: 4px;
+                padding: 6px 12px;
+            }}
+            QPushButton:hover {{
+                background-color: {hover_color};
+            }}
+            QPushButton:checked {{
+                background-color: {selected_text};
+                color: white;
+            }}
+        """)
+        
         # 顶部标题栏
-        header = QLabel("FocusFlow / 过去 7 天生产力洞察")
-        header.setStyleSheet("color: #9CDCFE; font-size: 18px; font-weight: bold; padding: 10px;")
+        header = QLabel("FocusFlow / 每日工作效率分析")
+        header.setObjectName("dashboardHeader")
+        header.setStyleSheet(f"color: {header_color}; font-size: 18px; font-weight: bold; padding: 10px;")
         header.setAlignment(Qt.AlignCenter)
         layout.addWidget(header)
         
@@ -855,7 +998,7 @@ class DataDashboardWindow(QDialog):
         filter_layout.setContentsMargins(20, 10, 20, 10)
         
         # 日期选择
-        filter_layout.addWidget(QLabel("📅 日期:"))
+        filter_layout.addWidget(QLabel("日期:"))
         self.date_edit = QComboBox()
         self.date_edit.setEditable(True)
         self.date_edit.setFixedWidth(150)
@@ -907,14 +1050,6 @@ class DataDashboardWindow(QDialog):
         self.combo_project.currentTextChanged.connect(self.on_filter_changed)
         filter_layout.addWidget(self.combo_project)
         
-        # 时长阈值筛选
-        filter_layout.addWidget(QLabel("时长:"))
-        self.combo_threshold = QComboBox()
-        self.combo_threshold.addItems(["≥0 分钟", "≥1 分钟", "≥5 分钟", "≥10 分钟", "≥30 分钟"])
-        self.combo_threshold.setFixedWidth(100)
-        self.combo_threshold.currentTextChanged.connect(self.on_filter_changed)
-        filter_layout.addWidget(self.combo_threshold)
-        
         filter_layout.addStretch()
         
         # 刷新按钮
@@ -926,28 +1061,8 @@ class DataDashboardWindow(QDialog):
         
         # 创建标签页容器
         self.tab_widget = QTabWidget()
-        self.tab_widget.setStyleSheet("""
-            QTabWidget::pane {
-                border: 1px solid #333333;
-                background-color: #1E1E1E;
-            }
-            QTabBar::tab {
-                background-color: #2D2D2D;
-                color: #CCCCCC;
-                padding: 8px 20px;
-                border: 1px solid #333333;
-                border-bottom: none;
-                border-top-left-radius: 4px;
-                border-top-right-radius: 4px;
-            }
-            QTabBar::tab:selected {
-                background-color: #1E1E1E;
-                color: #9CDCFE;
-            }
-            QTabBar::tab:hover {
-                background-color: #3E3E3E;
-            }
-        """)
+        # 使用对象名称来区分，样式由全局样式表控制
+        self.tab_widget.setObjectName("dashboardTabWidget")
         
         # 第 1 页：时间轴和列表
         page1 = QWidget()
@@ -958,38 +1073,35 @@ class DataDashboardWindow(QDialog):
         view_switch_layout = QHBoxLayout()
         view_switch_layout.setContentsMargins(20, 10, 20, 10)
         
-        self.btn_timeline_view = QPushButton("📊 时间轴")
+        self.btn_timeline_view = QPushButton("时间轴")
         self.btn_timeline_view.setCheckable(True)
         self.btn_timeline_view.setChecked(True)
         self.btn_timeline_view.clicked.connect(self.switch_to_timeline)
         view_switch_layout.addWidget(self.btn_timeline_view)
         
-        self.btn_list_view = QPushButton("📋 详细列表")
+        self.btn_list_view = QPushButton("详细列表")
         self.btn_list_view.setCheckable(True)
         self.btn_list_view.setChecked(False)
         self.btn_list_view.clicked.connect(self.switch_to_list)
         view_switch_layout.addWidget(self.btn_list_view)
         
-        self.btn_project_stats = QPushButton("📊 项目统计")
+        self.btn_project_stats = QPushButton("项目统计")
         self.btn_project_stats.setCheckable(True)
         self.btn_project_stats.setChecked(False)
         self.btn_project_stats.clicked.connect(self.switch_to_project_stats)
         view_switch_layout.addWidget(self.btn_project_stats)
         
-        self.btn_time_slots = QPushButton("🕐 时间段")
-        self.btn_time_slots.setCheckable(True)
-        self.btn_time_slots.setChecked(False)
-        self.btn_time_slots.clicked.connect(self.switch_to_time_slots)
-        view_switch_layout.addWidget(self.btn_time_slots)
+        view_switch_layout.addSpacing(20)
         
-        # 间隔阈值选择器
-        view_switch_layout.addWidget(QLabel("间隔阈值:"))
-        self.threshold_selector = QComboBox()
-        self.threshold_selector.addItems(["5 分钟", "10 分钟", "15 分钟", "30 分钟"])
-        self.threshold_selector.setCurrentIndex(2)  # 默认 15 分钟
-        self.threshold_selector.setFixedWidth(100)
-        self.threshold_selector.currentIndexChanged.connect(self.on_threshold_changed)
-        view_switch_layout.addWidget(self.threshold_selector)
+        # 时长阈值筛选（只影响时间轴和列表）
+        view_switch_layout.addWidget(QLabel("时长阈值:"))
+        self.combo_threshold = QComboBox()
+        self.combo_threshold.addItems(["≥0 分钟", "≥1 分钟", "≥5 分钟", "≥10 分钟", "≥30 分钟"])
+        self.combo_threshold.setFixedWidth(100)
+        self.combo_threshold.currentTextChanged.connect(self.on_filter_changed)
+        view_switch_layout.addWidget(self.combo_threshold)
+        
+        view_switch_layout.addStretch()
         
         # 导出按钮
         self.btn_export = QPushButton("📥 导出 CSV")
@@ -1000,7 +1112,7 @@ class DataDashboardWindow(QDialog):
         page1_layout.addLayout(view_switch_layout)
         
         # 时间轴区域
-        timeline_label = QLabel(f"📅 {self.selected_date} 时间轴 (滚轮缩放 / 拖拽平移)")
+        timeline_label = QLabel(f"{self.selected_date} 时间轴 (滚轮缩放 / 拖拽平移)")
         timeline_label.setStyleSheet("color: #9CDCFE; font-size: 14px; font-weight: bold; padding: 10px 20px;")
         page1_layout.addWidget(timeline_label)
         
@@ -1097,55 +1209,6 @@ class DataDashboardWindow(QDialog):
         
         page1_layout.addWidget(self.project_stats_container)
         
-        # 时间段视图容器（默认隐藏）
-        self.time_slots_container = QWidget()
-        self.time_slots_container.setVisible(False)
-        
-        time_slots_layout = QVBoxLayout(self.time_slots_container)
-        time_slots_layout.setContentsMargins(20, 10, 20, 10)
-        
-        # 时间段操作按钮
-        time_slots_toolbar = QHBoxLayout()
-        
-        self.btn_expand_all_slots = QPushButton("📖 展开全部")
-        self.btn_expand_all_slots.clicked.connect(self.expand_all_time_slots)
-        self.btn_expand_all_slots.setFixedWidth(100)
-        time_slots_toolbar.addWidget(self.btn_expand_all_slots)
-        
-        self.btn_collapse_all_slots = QPushButton("📕 折叠全部")
-        self.btn_collapse_all_slots.clicked.connect(self.collapse_all_time_slots)
-        self.btn_collapse_all_slots.setFixedWidth(100)
-        time_slots_toolbar.addWidget(self.btn_collapse_all_slots)
-        
-        time_slots_toolbar.addStretch()
-        time_slots_layout.addLayout(time_slots_toolbar)
-        
-        # 创建可滚动区域用于放置时间段分组
-        self.time_slots_scroll = QScrollArea()
-        self.time_slots_scroll.setWidgetResizable(True)
-        self.time_slots_scroll.setFrameShape(QScrollArea.NoFrame)
-        self.time_slots_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        
-        # 时间段分组容器
-        self.time_slots_groups_container = QWidget()
-        self.time_slots_groups_layout = QVBoxLayout(self.time_slots_groups_container)
-        self.time_slots_groups_layout.setAlignment(Qt.AlignTop)
-        self.time_slots_groups_layout.setSpacing(5)
-        
-        self.time_slots_scroll.setWidget(self.time_slots_groups_container)
-        time_slots_layout.addWidget(self.time_slots_scroll)
-        
-        # 时间段统计信息
-        self.lbl_time_slots_stats = QLabel("")
-        self.lbl_time_slots_stats.setStyleSheet("color: #888888; font-size: 12px; padding: 5px;")
-        self.lbl_time_slots_stats.setAlignment(Qt.AlignCenter)
-        time_slots_layout.addWidget(self.lbl_time_slots_stats)
-        
-        # 存储所有时间段分组
-        self.time_slot_groups = {}
-        
-        page1_layout.addWidget(self.time_slots_container)
-        
         # 统计信息
         self.lbl_timeline_stats = QLabel("")
         self.lbl_timeline_stats.setStyleSheet("color: #888888; font-size: 12px; padding: 5px 20px;")
@@ -1153,7 +1216,7 @@ class DataDashboardWindow(QDialog):
         page1_layout.addWidget(self.lbl_timeline_stats)
         
         # 添加第 1 页到标签页
-        self.tab_widget.addTab(page1, "📅 时间明细")
+        self.tab_widget.addTab(page1, "时间明细")
         
         # 第 2 页：统计分析
         page2 = QWidget()
@@ -1175,8 +1238,84 @@ class DataDashboardWindow(QDialog):
         
         page2_layout.addLayout(chart_layout)
         
-        # 添加第 2 页到标签页
-        self.tab_widget.addTab(page2, "📊 统计分析")
+        # 第 3 页：项目时间线
+        page3 = QWidget()
+        page3_layout = QVBoxLayout(page3)
+        page3_layout.setContentsMargins(0, 0, 0, 0)
+        
+        # 项目时间线工具栏
+        timeline_toolbar = QHBoxLayout()
+        timeline_toolbar.setContentsMargins(20, 10, 20, 10)
+        
+        # 阈值选择
+        timeline_toolbar.addWidget(QLabel("间隔阈值:"))
+        self.project_timeline_threshold = QComboBox()
+        self.project_timeline_threshold.addItems(["5 分钟", "10 分钟", "15 分钟", "30 分钟"])
+        self.project_timeline_threshold.setCurrentIndex(2)  # 默认 15 分钟
+        self.project_timeline_threshold.setFixedWidth(100)
+        self.project_timeline_threshold.currentTextChanged.connect(self.load_project_timeline_data)
+        timeline_toolbar.addWidget(self.project_timeline_threshold)
+        
+        timeline_toolbar.addStretch()
+        
+        # 刷新按钮
+        btn_refresh_timeline = QPushButton("🔄 刷新")
+        btn_refresh_timeline.clicked.connect(self.load_project_timeline_data)
+        timeline_toolbar.addWidget(btn_refresh_timeline)
+        
+        # 导出按钮
+        btn_export_timeline = QPushButton("导出")
+        btn_export_timeline.clicked.connect(self.export_project_timeline)
+        timeline_toolbar.addWidget(btn_export_timeline)
+        
+        page3_layout.addLayout(timeline_toolbar)
+        
+        # 创建滚动区域
+        self.project_timeline_scroll = QScrollArea()
+        self.project_timeline_scroll.setWidgetResizable(True)
+        self.project_timeline_scroll.setFrameShape(QScrollArea.NoFrame)
+        self.project_timeline_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        
+        # 内容容器
+        self.project_timeline_content = QWidget()
+        self.project_timeline_layout = QVBoxLayout(self.project_timeline_content)
+        self.project_timeline_layout.setAlignment(Qt.AlignTop)
+        self.project_timeline_layout.setSpacing(5)
+        
+        self.project_timeline_scroll.setWidget(self.project_timeline_content)
+        page3_layout.addWidget(self.project_timeline_scroll)
+        
+        # 统计信息
+        self.lbl_project_timeline_stats = QLabel("")
+        self.lbl_project_timeline_stats.setStyleSheet("color: #888888; font-size: 12px; padding: 10px;")
+        self.lbl_project_timeline_stats.setAlignment(Qt.AlignCenter)
+        page3_layout.addWidget(self.lbl_project_timeline_stats)
+        
+        # 添加第 2 页到标签页（项目时间线）
+        self.tab_widget.addTab(page3, "项目时间线")
+        
+        # 第 2 页：统计分析
+        page2 = QWidget()
+        page2_layout = QVBoxLayout(page2)
+        page2_layout.setContentsMargins(0, 0, 0, 0)
+        
+        # 图表容器（左右分栏）
+        chart_layout = QHBoxLayout()
+        chart_layout.setContentsMargins(20, 20, 20, 20)
+        
+        # 创建两个独立的 Figure 画布
+        self.fig_bar = Figure(figsize=(6, 4), dpi=100)
+        self.canvas_bar = FigureCanvas(self.fig_bar)
+        self.fig_pie = Figure(figsize=(4, 4), dpi=100)
+        self.canvas_pie = FigureCanvas(self.fig_pie)
+        
+        chart_layout.addWidget(self.canvas_bar, stretch=3)
+        chart_layout.addWidget(self.canvas_pie, stretch=2)
+        
+        page2_layout.addLayout(chart_layout)
+        
+        # 添加第 3 页到标签页（统计分析）
+        self.tab_widget.addTab(page2, "统计分析")
         
         layout.addWidget(self.tab_widget)
         
@@ -1354,6 +1493,12 @@ class DataDashboardWindow(QDialog):
         
         # 加载列表数据
         self.load_list_data(self.selected_date, app_filter, project_filter, threshold_seconds)
+        
+        # 加载项目统计数据
+        self.load_project_stats_data(self.selected_date, app_filter, project_filter, threshold_seconds)
+        
+        # 加载项目时间线数据
+        self.load_project_timeline_data(app_filter, project_filter)
     
     def switch_to_timeline(self):
         """切换到时间轴视图"""
@@ -1378,62 +1523,35 @@ class DataDashboardWindow(QDialog):
         self.btn_project_stats.setChecked(True)
         self.btn_timeline_view.setChecked(False)
         self.btn_list_view.setChecked(False)
-        self.btn_time_slots.setChecked(False)
         self.timeline.setVisible(False)
         self.list_view_container.setVisible(False)
         self.project_stats_container.setVisible(True)
-        self.time_slots_container.setVisible(False)
         self.btn_export.setEnabled(False)  # 项目统计禁用导出
         
+        # 获取当前筛选参数
+        app_filter = self.combo_app.currentText()
+        if app_filter == "全部":
+            app_filter = None
+        
+        # 获取项目筛选（使用 userData）
+        project_data = self.combo_project.currentData()
+        if project_data is None:  # "全部"选项
+            project_filter = None
+        elif project_data == '未分配':
+            project_filter = '未分配'
+        else:
+            # 使用项目名称作为筛选
+            project_filter = self.combo_project.currentText()
+        
+        # 获取时长阈值（分钟）
+        threshold_minutes = self.combo_threshold.currentText().replace("分钟", "").replace("≥", "").strip()
+        try:
+            threshold_seconds = int(threshold_minutes) * 60
+        except:
+            threshold_seconds = 0
+        
         # 加载项目统计数据
-        self.load_project_stats_data(self.selected_date)
-    
-    def switch_to_time_slots(self):
-        """切换到时间段视图"""
-        self.btn_time_slots.setChecked(True)
-        self.btn_timeline_view.setChecked(False)
-        self.btn_list_view.setChecked(False)
-        self.btn_project_stats.setChecked(False)
-        self.timeline.setVisible(False)
-        self.list_view_container.setVisible(False)
-        self.project_stats_container.setVisible(False)
-        self.time_slots_container.setVisible(True)
-        self.btn_export.setEnabled(False)  # 时间段视图禁用导出
-        
-        # 获取当前阈值
-        threshold_minutes = self.get_current_threshold()
-        
-        # 加载时间段数据
-        self.load_time_slots_data(self.selected_date, threshold_minutes)
-    
-    def get_current_threshold(self):
-        """获取当前选择的间隔阈值（分钟）"""
-        thresholds = [5, 10, 15, 30]
-        index = self.threshold_selector.currentIndex()
-        return thresholds[index] if 0 <= index < len(thresholds) else 15
-    
-    def on_threshold_changed(self):
-        """当间隔阈值改变时"""
-        if self.btn_time_slots.isChecked():
-            self.load_time_slots_data(self.selected_date, self.get_current_threshold())
-    
-    def expand_all_time_slots(self):
-        """展开所有时间段"""
-        for group in self.time_slot_groups.values():
-            if not group.header_btn.isChecked():
-                group.header_btn.setChecked(True)
-                group.toggle_expand()
-        self.btn_expand_all_slots.setEnabled(False)
-        self.btn_collapse_all_slots.setEnabled(True)
-    
-    def collapse_all_time_slots(self):
-        """折叠所有时间段"""
-        for group in self.time_slot_groups.values():
-            if group.header_btn.isChecked():
-                group.header_btn.setChecked(False)
-                group.toggle_expand()
-        self.btn_expand_all_slots.setEnabled(True)
-        self.btn_collapse_all_slots.setEnabled(False)
+        self.load_project_stats_data(self.selected_date, app_filter, project_filter, threshold_seconds)
     
     def expand_all_groups(self):
         """展开所有分组"""
@@ -1452,6 +1570,217 @@ class DataDashboardWindow(QDialog):
                 group.toggle_expand()
         self.btn_expand_all.setEnabled(True)
         self.btn_collapse_all.setEnabled(False)
+    
+    def load_project_timeline_data(self, app_filter=None, project_filter=None):
+        """
+        加载项目时间线数据（3 层结构）
+        """
+        # 清空旧数据
+        for i in reversed(range(self.project_timeline_layout.count())):
+            widget = self.project_timeline_layout.itemAt(i).widget()
+            if widget:
+                widget.deleteLater()
+        
+        # 使用全局日期
+        date = self.selected_date
+        
+        # 获取项目时间线的阈值
+        threshold_text = self.project_timeline_threshold.currentText()
+        threshold_minutes = int(threshold_text.replace('分钟', ''))
+        
+        # 获取聚合数据
+        timeline_data = aggregate_project_timeline(date, threshold_minutes)
+        
+        # 应用筛选
+        if app_filter or project_filter:
+            timeline_data = self.filter_timeline_data(timeline_data, app_filter, project_filter)
+        
+        if not timeline_data:
+            self.lbl_project_timeline_stats.setText("📭 当天暂无数据")
+            return
+        
+        # 构建树形结构
+        tree_data = build_project_timeline_tree(timeline_data)
+        
+        if not tree_data:
+            self.lbl_project_timeline_stats.setText("📭 当天暂无数据")
+            return
+        
+        # 创建树形组件
+        total_seconds = 0
+        total_projects = 0
+        total_time_slots = 0
+        total_records = 0
+        
+        for root_name, root_data in tree_data.items():
+            root_widget = ProjectTreeNodeWidget(
+                name=root_name,
+                level=0,
+                total_duration=root_data['total_duration'],
+                time_range=root_data['time_range'],
+                children=root_data.get('children', {})
+            )
+            self.project_timeline_layout.addWidget(root_widget)
+            
+            # 统计
+            total_seconds += root_data['total_duration']
+            total_projects += 1
+            
+            # 递归统计子项目
+            def count_children(children):
+                nonlocal total_time_slots, total_records
+                for child_name, child_data in children.items():
+                    if 'time_slots' in child_data:
+                        # 最底层
+                        total_time_slots += len(child_data['time_slots'])
+                        total_records += child_data.get('record_count', 0)
+                    else:
+                        # 还有下一层
+                        count_children(child_data.get('children', {}))
+            
+            count_children(root_data.get('children', {}))
+        
+        # 更新统计信息
+        total_hours = total_seconds // 3600
+        total_minutes = (total_seconds % 3600) // 60
+        
+        self.lbl_project_timeline_stats.setText(
+            f" 总计：{total_hours}小时{total_minutes}分钟  |  "
+            f"{total_projects} 个项目  |  "
+            f"{total_time_slots} 个时间段  |  "
+            f"{total_records} 条记录"
+        )
+    
+    def filter_timeline_data(self, data, app_filter, project_filter):
+        """
+        根据筛选条件过滤项目时间线数据
+        
+        Args:
+            data: aggregate_project_timeline 返回的数据
+            app_filter: 应用筛选条件
+            project_filter: 项目筛选条件
+        
+        Returns:
+            过滤后的数据
+        """
+        if not app_filter and not project_filter:
+            return data
+        
+        filtered = {}
+        
+        for project_path, project_data in data.items():
+            # 项目筛选（支持完整层级）
+            if project_filter and project_filter != '全部':
+                # 检查项目路径是否包含筛选的项目
+                if project_filter not in project_path:
+                    continue
+            
+            # 应用筛选（检查该项目的记录是否包含该应用）
+            if app_filter and app_filter != '全部':
+                has_app = False
+                for slot in project_data['time_slots']:
+                    if app_filter in slot['apps']:
+                        has_app = True
+                        break
+                if not has_app:
+                    continue
+            
+            filtered[project_path] = project_data
+        
+        return filtered
+    
+    def export_project_timeline(self):
+        """
+        导出项目时间线到 CSV
+        """
+        from datetime import datetime as dt_module
+        import csv
+        
+        # 选择保存路径
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "导出项目时间线",
+            f"项目时间线_{datetime.now().strftime('%Y%m%d')}.csv",
+            "CSV 文件 (*.csv)"
+        )
+        
+        if not file_path:
+            return
+        
+        try:
+            # 获取参数
+            date = self.project_timeline_date.date().toString('yyyy-MM-dd')
+            threshold_text = self.project_timeline_threshold.currentText()
+            threshold_minutes = int(threshold_text.replace('分钟', ''))
+            
+            # 获取数据
+            timeline_data = aggregate_project_timeline(date, threshold_minutes)
+            
+            if not timeline_data:
+                QMessageBox.warning(self, "提示", "没有可导出的数据")
+                return
+            
+            # 写入 CSV
+            with open(file_path, 'w', newline='', encoding='utf-8-sig') as f:
+                writer = csv.writer(f)
+                
+                # 表头
+                writer.writerow([
+                    '日期',
+                    '第 1 层项目',
+                    '第 2 层项目',
+                    '第 3 层项目',
+                    '开始时间',
+                    '结束时间',
+                    '时长 (秒)',
+                    '时长 (格式)',
+                    '应用',
+                    '文件路径'
+                ])
+                
+                # 递归写入数据
+                for project_path, data in timeline_data.items():
+                    for slot in data['time_slots']:
+                        # 填充项目路径到 3 层
+                        layer1 = project_path[0] if len(project_path) > 0 else ''
+                        layer2 = project_path[1] if len(project_path) > 1 else ''
+                        layer3 = project_path[2] if len(project_path) > 2 else ''
+                        
+                        # 收集应用
+                        apps = ', '.join(slot['apps']) if isinstance(slot['apps'], set) else str(slot['apps'])
+                        
+                        # 计算时长
+                        duration = slot['end_sec'] - slot['start_sec']
+                        
+                        # 为每条记录写入一行
+                        for log in slot['logs']:
+                            # 解析日志时间
+                            try:
+                                ts = dt_module.fromisoformat(log['timestamp'].split('.')[0])
+                                log_start_sec = ts.hour * 3600 + ts.minute * 60 + ts.second
+                                log_start = format_time(log_start_sec)
+                                log_end = format_time(log_start_sec + log['duration'])
+                            except:
+                                log_start = "N/A"
+                                log_end = "N/A"
+                            
+                            writer.writerow([
+                                date,
+                                layer1,
+                                layer2,
+                                layer3,
+                                log_start,
+                                log_end,
+                                log['duration'],
+                                format_duration(log['duration']),
+                                log['app_name'],
+                                log['file_path'] or ''
+                            ])
+            
+            QMessageBox.information(self, "导出成功", f"项目时间线已导出到：\n{file_path}")
+        
+        except Exception as e:
+            QMessageBox.critical(self, "导出失败", f"导出时发生错误：\n{str(e)}")
     
     def load_project_stats_data(self, date, app_filter=None, project_filter=None, threshold_seconds=0):
         """
@@ -1624,205 +1953,6 @@ class DataDashboardWindow(QDialog):
         # 初始化按钮状态
         self.btn_expand_all.setEnabled(True)
         self.btn_collapse_all.setEnabled(True)
-    
-    def load_time_slots_data(self, date, threshold_minutes=15):
-        """
-        加载时间段视图数据（按项目和间隔阈值聚合）
-        """
-        from datetime import datetime as dt_module
-        
-        # 清空旧分组
-        for group in self.time_slot_groups.values():
-            group.deleteLater()
-        self.time_slot_groups.clear()
-        
-        conn = get_connection()
-        
-        # 计算日期范围
-        today_start = f"{date} 00:00:00"
-        tomorrow_start = f"{dt_module.strptime(date, '%Y-%m-%d').replace(hour=0, minute=0, second=0) + timedelta(days=1)}"
-        
-        # 查询原始记录
-        query = """
-            SELECT timestamp, duration, app_name, file_path 
-            FROM activity_log 
-            WHERE timestamp >= ? AND timestamp < ?
-        """
-        params = [today_start, tomorrow_start]
-        
-        logs = conn.execute(query, params).fetchall()
-        
-        if not logs:
-            conn.close()
-            self.lbl_time_slots_stats.setText("📭 当天暂无数据")
-            return
-        
-        # 聚合同一应用的连续记录
-        blocks = []
-        current_block = None
-        
-        for timestamp_str, duration, app, fpath in logs:
-            try:
-                dtime = dt_module.fromisoformat(timestamp_str.split('.')[0])
-                start_sec = dtime.hour * 3600 + dtime.minute * 60 + dtime.second
-                end_sec = start_sec + duration
-                
-                if current_block is None:
-                    current_block = {
-                        'start_sec': start_sec,
-                        'end_sec': end_sec,
-                        'app': app,
-                        'file': fpath,
-                        'project': None
-                    }
-                else:
-                    if start_sec - current_block['end_sec'] <= 60 and app == current_block['app']:
-                        current_block['end_sec'] = end_sec
-                    else:
-                        blocks.append(current_block)
-                        current_block = {
-                            'start_sec': start_sec,
-                            'end_sec': end_sec,
-                            'app': app,
-                            'file': fpath,
-                            'project': None
-                        }
-            except:
-                continue
-        
-        if current_block:
-            blocks.append(current_block)
-        
-        # 查询项目信息
-        for block in blocks:
-            if block['file'] and not block['file'].startswith('['):
-                proj_query = """
-                    SELECT p.project_name 
-                    FROM file_assignment fa
-                    JOIN projects p ON fa.project_id = p.id
-                    WHERE fa.file_path = ?
-                """
-                result = conn.execute(proj_query, (block['file'],)).fetchone()
-                if result:
-                    block['project'] = result[0]
-                else:
-                    block['project'] = '未分配'
-            else:
-                block['project'] = '未分配'
-        
-        conn.close()
-        
-        # 按项目分组
-        projects_data = {}  # {project: [blocks]}
-        
-        for block in blocks:
-            project = block['project']
-            if project not in projects_data:
-                projects_data[project] = []
-            projects_data[project].append(block)
-        
-        # 对每个项目，按间隔阈值聚合时间段
-        threshold_seconds = threshold_minutes * 60
-        total_seconds = 0
-        total_time_slots = 0
-        total_records = 0
-        
-        for project, proj_blocks in sorted(projects_data.items()):
-            # 按开始时间排序
-            proj_blocks.sort(key=lambda x: x['start_sec'])
-            
-            # 聚合时间段
-            time_slots = []
-            current_slot = None
-            
-            for block in proj_blocks:
-                if current_slot is None:
-                    current_slot = {
-                        'start_sec': block['start_sec'],
-                        'end_sec': block['end_sec'],
-                        'blocks': [block]
-                    }
-                else:
-                    # 如果间隔小于阈值，合并到当前时间段
-                    if block['start_sec'] - current_slot['end_sec'] <= threshold_seconds:
-                        current_slot['end_sec'] = max(current_slot['end_sec'], block['end_sec'])
-                        current_slot['blocks'].append(block)
-                    else:
-                        # 否则创建新的时间段
-                        time_slots.append(current_slot)
-                        current_slot = {
-                            'start_sec': block['start_sec'],
-                            'end_sec': block['end_sec'],
-                            'blocks': [block]
-                        }
-            
-            if current_slot:
-                time_slots.append(current_slot)
-            
-            # 创建项目分组
-            proj_total = sum(slot['end_sec'] - slot['start_sec'] for slot in time_slots)
-            total_seconds += proj_total
-            total_time_slots += len(time_slots)
-            total_records += sum(len(slot['blocks']) for slot in time_slots)
-            
-            # 格式化时间范围
-            proj_start = min(slot['start_sec'] for slot in time_slots)
-            proj_end = max(slot['end_sec'] for slot in time_slots)
-            start_time_str = f"{int(proj_start//3600):02d}:{int((proj_start%3600)//60):02d}"
-            end_time_str = f"{int(proj_end//3600):02d}:{int((proj_end%3600)//60):02d}"
-            
-            group = ProjectGroupWidget(project, proj_total, start_time_str, end_time_str, total_records)
-            
-            # 为每个时间段创建子组件
-            for slot in time_slots:
-                slot_start = f"{int(slot['start_sec']//3600):02d}:{int((slot['start_sec']%3600)//60):02d}"
-                slot_end = f"{int(slot['end_sec']//3600):02d}:{int((slot['end_sec']%3600)//60):02d}"
-                slot_duration = slot['end_sec'] - slot['start_sec']
-                
-                # 收集该时间段使用的应用
-                apps_in_slot = {}
-                for block in slot['blocks']:
-                    app = block['app']
-                    if app not in apps_in_slot:
-                        apps_in_slot[app] = 0
-                    apps_in_slot[app] += block['end_sec'] - block['start_sec']
-                
-                apps_used = ', '.join([f"{app}" for app in apps_in_slot.keys()])
-                
-                # 创建时间段组件
-                time_slot_widget = TimeSlotWidget(slot_start, slot_end, slot_duration, apps_used)
-                
-                # 添加详细记录
-                for block in slot['blocks']:
-                    b_start = f"{int(block['start_sec']//3600):02d}:{int((block['start_sec']%3600)//60):02d}:{int(block['start_sec']%60):02d}"
-                    b_end = f"{int(block['end_sec']//3600):02d}:{int((block['end_sec']%3600)//60):02d}:{int(block['end_sec']%60):02d}"
-                    b_duration = format_duration(block['end_sec'] - block['start_sec'])
-                    
-                    file_path = block['file']
-                    if file_path and not file_path.startswith('['):
-                        file_path = os.path.basename(file_path)
-                    
-                    time_slot_widget.add_record(b_start, b_end, b_duration, block['app'], file_path or '-')
-                
-                group.content_layout.addWidget(time_slot_widget)
-            
-            self.time_slots_groups_layout.addWidget(group)
-            self.time_slot_groups[project] = group
-        
-        # 更新统计
-        total_hours = total_seconds // 3600
-        total_minutes = (total_seconds % 3600) // 60
-        
-        unique_projects = len(projects_data)
-        unique_apps = len(set(b['app'] for b in blocks))
-        
-        self.lbl_time_slots_stats.setText(
-            f"总计：{total_hours}小时{total_minutes}分钟 | {unique_projects} 个项目 | {total_time_slots} 个时间段 | {unique_apps} 个应用 | {total_records} 条记录"
-        )
-        
-        # 初始化按钮状态
-        self.btn_expand_all_slots.setEnabled(True)
-        self.btn_collapse_all_slots.setEnabled(True)
     
     def load_list_data(self, date, app_filter=None, project_filter=None, threshold_seconds=0):
         """
@@ -2093,7 +2223,7 @@ class DataDashboardWindow(QDialog):
         if threshold_seconds > 0:
             blocks = [b for b in blocks if (b[1] - b[0]) >= threshold_seconds]
         
-        print(f"📊 聚合后 {len(blocks)} 个时间块")
+        print(f" 聚合后 {len(blocks)} 个时间块")
         
         # 更新的时间轴
         self.timeline.update_data(blocks)
@@ -2217,19 +2347,19 @@ class TimelineWidget(QWidget):
                 # 创建详情对话框
                 from PySide6.QtWidgets import QDialog, QVBoxLayout, QLabel, QPushButton, QTextEdit
                 dialog = QDialog(self.window())
-                dialog.setWindowTitle("⏱️ 时间使用详情")
+                dialog.setWindowTitle("时间使用详情")
                 dialog.setMinimumWidth(500)
                 dialog.setMinimumHeight(300)
                 
                 layout = QVBoxLayout(dialog)
                 
                 # 标题
-                title = QLabel(f"<h3>📊 时间使用详情</h3>")
+                title = QLabel(f"<h3>时间使用详情</h3>")
                 layout.addWidget(title)
                 
                 # 应用信息
                 if is_idle:
-                    info = QLabel(f"<b>类型：</b> 💤 闲置/休息")
+                    info = QLabel(f"<b>类型：</b> 闲置/休息")
                 else:
                     info = QLabel(f"""
                         <b>应用：</b> {app}<br>
@@ -2293,10 +2423,10 @@ class TimelineWidget(QWidget):
                     duration_sec = int(end - start)
                     duration_str = format_duration(duration_sec)
                     if is_idle:
-                        self.setToolTip(f"💤 闲置 / 休息\n{start_str} - {end_str}\n⏱️ 时长：{duration_str}")
+                        self.setToolTip(f"闲置 / 休息\n{start_str} - {end_str}\n时长：{duration_str}")
                     else:
                         d_path = fpath if fpath.startswith("[") else os.path.basename(fpath)
-                        self.setToolTip(f"⏱️ {app}\n📄 {d_path}\n{start_str} - {end_str}\n⏱️ 时长：{duration_str}")
+                        self.setToolTip(f"{app}\n{d_path}\n{start_str} - {end_str}\n时长：{duration_str}")
                     found = True
                     break
             if not found: self.setToolTip("")
@@ -2370,8 +2500,12 @@ class TimelineWidget(QWidget):
 class DashboardV2(QMainWindow):
     def __init__(self):
         super().__init__()
+        
+        # 读取配置的主题设置
+        self.is_dark_mode = get_config("app_theme", "dark") == "dark"
+        
         init_db()  
-        self.setWindowTitle("FocusFlow - 专业工时看板")
+        self.setWindowTitle("FocusFlow - Fenghu专业工时看板")
         self.resize(1300, 800)
         
         # 完美状态记录容器
@@ -2458,13 +2592,13 @@ class DashboardV2(QMainWindow):
         header_layout.setContentsMargins(15, 0, 15, 0)
         
         title_label = QLabel("FocusFlow")
-        # 【新增】：数据大屏入口按钮
-        self.btn_dashboard = QPushButton("📊 数据大屏")
+        # 数据大屏入口按钮
+        self.btn_dashboard = QPushButton("数据大屏")
         self.btn_dashboard.setStyleSheet("background-color: #31A8FF; color: white; font-weight: bold; padding: 4px 12px; border-radius: 4px; margin-left: 15px;")
         self.btn_dashboard.clicked.connect(lambda: DataDashboardWindow(self).exec())
         header_layout.addWidget(self.btn_dashboard)
-        # 【新增】：呼出悬浮秒表（确保 floating_widget 已初始化）
-        self.btn_float = QPushButton("📌 悬浮秒表")
+        # 呼出悬浮秒表（确保 floating_widget 已初始化）
+        self.btn_float = QPushButton("悬浮秒表")
         self.btn_float.setStyleSheet("background-color: #4A4A4A; color: white; font-weight: bold; padding: 4px 12px; border-radius: 4px; margin-left: 10px;")
         self.btn_float.clicked.connect(self.floating_widget.show)
         header_layout.addWidget(self.btn_float)
@@ -2479,17 +2613,17 @@ class DashboardV2(QMainWindow):
         header_layout.addWidget(self.lbl_status)
         header_layout.addStretch()
         
-        self.btn_blacklist = QPushButton("🚫 黑名单")
+        self.btn_blacklist = QPushButton("黑名单")
         self.btn_blacklist.clicked.connect(self.open_blacklist)
-        self.btn_db = QPushButton("🗄️ 数据库")
+        self.btn_db = QPushButton("数据库")
         self.btn_db.clicked.connect(self.open_database_manager)
         
         # 【新增】：批量导出结算大单按钮
-        self.btn_export_all = QPushButton("💰 导出全盘月度总结算单")
+        self.btn_export_all = QPushButton("导出全盘月度总结算单")
         self.btn_export_all.setStyleSheet("background-color: #2E8B57; color: white; font-weight: bold; padding: 6px 16px; border-radius: 4px;")
         self.btn_export_all.clicked.connect(self.action_export_all_bills)
         
-        self.btn_settings = QPushButton("⚙ 设置")
+        self.btn_settings = QPushButton("设置")
         self.btn_settings.clicked.connect(self.open_settings)
         
         header_layout.addWidget(self.btn_export_all)
@@ -2515,15 +2649,15 @@ class DashboardV2(QMainWindow):
         font_time = "font-family: 'Menlo', 'Consolas', monospace; font-size: 13px; font-weight: bold;"
         
         # 第一行：项目
-        self.lbl_stat_p_name = QLabel("📊 项目: 未选中")
+        self.lbl_stat_p_name = QLabel("项目：未选中")
         self.lbl_stat_p_name.setStyleSheet(f"color: #D4D4D4; {font_name}")
-        self.lbl_stat_p_times = QLabel("累积: 00:00:00    今日: 00:00:00")
+        self.lbl_stat_p_times = QLabel("累积：00:00:00    今日：00:00:00")
         self.lbl_stat_p_times.setStyleSheet(f"color: #CCCCCC; {font_time}")
         
         # 第二行：程序
-        self.lbl_stat_a_name = QLabel("🎯 程序: 无")
+        self.lbl_stat_a_name = QLabel("程序：无")
         self.lbl_stat_a_name.setStyleSheet(f"color: #68D391; {font_name}")
-        self.lbl_stat_a_times = QLabel("累积: 00:00:00    今日: 00:00:00    本次连续: 00:00:00")
+        self.lbl_stat_a_times = QLabel("累积：00:00:00    今日：00:00:00    本次连续：00:00:00")
         self.lbl_stat_a_times.setStyleSheet(f"color: #34C759; {font_time}")
         
         stats_layout.addWidget(self.lbl_stat_p_name, 0, 0, Qt.AlignLeft)
@@ -2543,7 +2677,7 @@ class DashboardV2(QMainWindow):
         left_layout = QVBoxLayout(left_panel)
         left_layout.setContentsMargins(10, 10, 5, 10)
         left_header = QHBoxLayout()
-        left_header.addWidget(QLabel("📁 项目管理", objectName="panelTitle"))
+        left_header.addWidget(QLabel("项目管理", objectName="panelTitle"))
         self.chk_archived = QCheckBox("显示归档")
         self.chk_archived.stateChanged.connect(self.refresh_data)
         left_header.addWidget(self.chk_archived)
@@ -2563,9 +2697,9 @@ class DashboardV2(QMainWindow):
         
         # 【新增】Inbox 标题栏（带分组视图切换和时长筛选）
         right_header = QHBoxLayout()
-        right_header.addWidget(QLabel("📥 Inbox 待分配 (自动捕获)", objectName="panelTitle"))
+        right_header.addWidget(QLabel("Inbox 待分配 (自动捕获)", objectName="panelTitle"))
         right_header.addStretch()
-        self.btn_inbox_group = QCheckBox("📊 分组视图")
+        self.btn_inbox_group = QCheckBox("分组视图")
         self.btn_inbox_group.setChecked(False)
         self.btn_inbox_group.stateChanged.connect(self.refresh_data)
         right_header.addWidget(self.btn_inbox_group)
@@ -2934,21 +3068,21 @@ class DashboardV2(QMainWindow):
             return f"{s//3600:02d}:{s%3600//60:02d}:{s%60:02d}"
 
         if is_idle:
-            self.lbl_status.setText(f"💤 闲置中 ({int(idle_seconds)} 秒)")
+            self.lbl_status.setText(f"闲置中 ({int(idle_seconds)} 秒)")
             self.lbl_status.setStyleSheet("color: #FF9F0A; font-weight: bold; font-size: 13px;")
             
-            self.lbl_stat_p_name.setText("📊 项目: 休息中")
-            self.lbl_stat_p_times.setText("累积: --:--:--    今日: --:--:--")
-            self.lbl_stat_a_name.setText("🎯 程序: 离开座位")
-            self.lbl_stat_a_times.setText("累积: --:--:--    今日: --:--:--    本次: --:--:--")
+            self.lbl_stat_p_name.setText("项目：休息中")
+            self.lbl_stat_p_times.setText("累积：--:--:--    今日：--:--:--")
+            self.lbl_stat_a_name.setText("程序：离开座位")
+            self.lbl_stat_a_times.setText("累积：--:--:--    今日：--:--:--    本次：--:--:--")
         else:
-            self.lbl_status.setText(f"🟢 正在追踪: {app_name} | {d_path}")
+            self.lbl_status.setText(f"正在追踪：{app_name} | {d_path}")
             self.lbl_status.setStyleSheet("color: #34C759; font-weight: bold; font-size: 13px;")
             
-            self.lbl_stat_p_name.setText(f"📊 项目: {p_name}")
-            self.lbl_stat_p_times.setText(f"累积: {fmt_full(p_total)}    今日: {fmt_full(p_today)}")
-            self.lbl_stat_a_name.setText(f"🎯 程序: {d_path}")
-            self.lbl_stat_a_times.setText(f"累积: {fmt_full(a_total)}    今日: {fmt_full(a_today)}    本次: {fmt_full(self._session_seconds)}")
+            self.lbl_stat_p_name.setText(f"项目：{p_name}")
+            self.lbl_stat_p_times.setText(f"累积：{fmt_full(p_total)}    今日：{fmt_full(p_today)}")
+            self.lbl_stat_a_name.setText(f"程序：{d_path}")
+            self.lbl_stat_a_times.setText(f"累积：{fmt_full(a_total)}    今日：{fmt_full(a_today)}    本次：{fmt_full(self._session_seconds)}")
 
         # 4. 同步分发给悬浮窗 (如果悬浮窗开着)
         if hasattr(self, 'floating_widget') and self.floating_widget.isVisible():
@@ -3019,7 +3153,7 @@ class DashboardV2(QMainWindow):
         conn.close()
     def _build_project_tree_recursive(self, node, parent_item, show_archived):
         stats = get_project_stats(node.id, include_children=False)
-        prefix = "📦 [归档] " if node.is_archived else "📁 "
+        prefix = "[归档] " if node.is_archived else ""
         item_name = QStandardItem(f"{prefix}{node.name}")
         item_name.setData(node.id, Qt.UserRole + 1) 
         item_name.setData(node.is_archived, Qt.UserRole + 3)
@@ -3201,9 +3335,8 @@ class DashboardV2(QMainWindow):
         for app_name in sorted(grouped_data.keys()):
             files = grouped_data[app_name]
             
-            # 创建分组头（不可选中，带图标和文件数）
-            app_icon = "🎯"
-            header_item = QStandardItem(f"{app_icon} {app_name} ({len(files)}个文件)")
+            # 创建分组头（不可选中，带文件数）
+            header_item = QStandardItem(f"{app_name} ({len(files)}个文件)")
             header_item.setSelectable(False)
             header_item.setData(app_name, Qt.UserRole + 5)  # 标记为程序分组头
             header_item.setData(True, Qt.UserRole + 6)      # 标记是分组头
@@ -3321,7 +3454,7 @@ class DashboardV2(QMainWindow):
         if file_path:
             menu.addAction("↩️ 移出记录 (回 Inbox)").triggered.connect(lambda: self.action_remove_file(file_path))
         elif project_id:
-            name_pure = item_node.text().replace("📁 ", "").replace("📦 [归档] ", "")
+            name_pure = item_node.text().replace("[归档] ", "")
             menu.addAction("➕ 新建子项目").triggered.connect(lambda: self.action_new_project(project_id))
             menu.addAction("✏️ 重命名").triggered.connect(lambda: self.action_rename_project(project_id, name_pure))
             menu.addAction("🤖 编辑自动匹配规则...").triggered.connect(lambda: ProjectRulesDialog(project_id, name_pure, self).exec())
@@ -3334,10 +3467,10 @@ class DashboardV2(QMainWindow):
             
             menu.addSeparator()
             if is_archived:
-                menu.addAction("🔄 取消归档 (恢复)").triggered.connect(lambda: self.action_restore_project(project_id))
+                menu.addAction("取消归档 (恢复)").triggered.connect(lambda: self.action_restore_project(project_id))
             else:
-                menu.addAction("📦 归档项目").triggered.connect(lambda: self.action_archive_project(project_id))
-            menu.addAction("❌ 删除").triggered.connect(lambda: self.action_delete_project(project_id))
+                menu.addAction("归档项目").triggered.connect(lambda: self.action_archive_project(project_id))
+            menu.addAction("删除").triggered.connect(lambda: self.action_delete_project(project_id))
 
         menu.exec_(self.tree_projects.viewport().mapToGlobal(pos))
 
@@ -3974,26 +4107,51 @@ class DashboardV2(QMainWindow):
         self.refresh_data()
 
     def apply_modern_theme(self):
-        self.setStyleSheet("""
-            QMainWindow { background-color: #1E1E1E; }
-            QWidget#header { background-color: #252526; }
-            QLabel#titleLabel { font-size: 20px; font-weight: bold; color: #FFFFFF; }
-            QLabel#statusLabel { color: #CCCCCC; }
-            QLabel#statsBar { background-color: #2D2D30; color: #D4D4D4; padding: 0px 20px; font-size: 13px; font-weight: bold; border-bottom: 1px solid #333333; }
-            QLabel#panelTitle { color: #9CDCFE; font-size: 13px; font-weight: bold; padding: 5px; }
-            QPushButton { background-color: #0E639C; color: white; border-radius: 4px; padding: 4px 12px; font-weight: bold; }
-            QPushButton:hover { background-color: #1177BB; }
-            QTreeView { background-color: #1E1E1E; color: #D4D4D4; border: 1px solid #333333; border-radius: 4px; padding: 4px; font-size: 13px; outline: 0;}
-            QTreeView::item { padding: 4px; border-radius: 4px; }
-            QTreeView::item:hover { background-color: #2A2D2E; }
-            QTreeView::item:selected { background-color: #37373D; color: #FFFFFF; }
-            QHeaderView::section { background-color: #252526; color: #999999; padding: 4px; border: none; border-right: 1px solid #333333; border-bottom: 1px solid #333333; font-weight: bold; font-size: 12px;}
-            QMenu { background-color: #252526; color: #CCCCCC; border: 1px solid #333333; }
-            QMenu::item:selected { background-color: #0E639C; color: white; }
-            QListWidget { background-color: #1E1E1E; color: #D4D4D4; border: 1px solid #333333; }
-            QListWidget::item:selected { background-color: #37373D; }
-            QCheckBox { color: #D4D4D4; }
-        """)
+        # 根据主题应用不同样式
+        if self.is_dark_mode:
+            # 深色主题
+            self.setStyleSheet("""
+                QMainWindow { background-color: #1E1E1E; }
+                QWidget#header { background-color: #252526; }
+                QLabel#titleLabel { font-size: 20px; font-weight: bold; color: #FFFFFF; }
+                QLabel#statusLabel { color: #CCCCCC; }
+                QLabel#statsBar { background-color: #2D2D30; color: #D4D4D4; padding: 0px 20px; font-size: 13px; font-weight: bold; border-bottom: 1px solid #333333; }
+                QLabel#panelTitle { color: #9CDCFE; font-size: 13px; font-weight: bold; padding: 5px; }
+                QPushButton { background-color: #0E639C; color: white; border-radius: 4px; padding: 4px 12px; font-weight: bold; }
+                QPushButton:hover { background-color: #1177BB; }
+                QTreeView { background-color: #1E1E1E; color: #D4D4D4; border: 1px solid #333333; border-radius: 4px; padding: 4px; font-size: 13px; outline: 0;}
+                QTreeView::item { padding: 4px; border-radius: 4px; }
+                QTreeView::item:hover { background-color: #2A2D2E; }
+                QTreeView::item:selected { background-color: #37373D; color: #FFFFFF; }
+                QHeaderView::section { background-color: #252526; color: #999999; padding: 4px; border: none; border-right: 1px solid #333333; border-bottom: 1px solid #333333; font-weight: bold; font-size: 12px;}
+                QMenu { background-color: #252526; color: #CCCCCC; border: 1px solid #333333; }
+                QMenu::item:selected { background-color: #0E639C; color: white; }
+                QListWidget { background-color: #1E1E1E; color: #D4D4D4; border: 1px solid #333333; }
+                QListWidget::item:selected { background-color: #37373D; }
+                QCheckBox { color: #D4D4D4; }
+            """)
+        else:
+            # 浅色主题
+            self.setStyleSheet("""
+                QMainWindow { background-color: #F5F5F5; }
+                QWidget#header { background-color: #FFFFFF; }
+                QLabel#titleLabel { font-size: 20px; font-weight: bold; color: #333333; }
+                QLabel#statusLabel { color: #666666; }
+                QLabel#statsBar { background-color: #E8E8E8; color: #333333; padding: 0px 20px; font-size: 13px; font-weight: bold; border-bottom: 1px solid #CCCCCC; }
+                QLabel#panelTitle { color: #0066CC; font-size: 13px; font-weight: bold; padding: 5px; }
+                QPushButton { background-color: #0078D4; color: white; border-radius: 4px; padding: 4px 12px; font-weight: bold; }
+                QPushButton:hover { background-color: #1084D8; }
+                QTreeView { background-color: #FFFFFF; color: #333333; border: 1px solid #CCCCCC; border-radius: 4px; padding: 4px; font-size: 13px; outline: 0;}
+                QTreeView::item { padding: 4px; border-radius: 4px; }
+                QTreeView::item:hover { background-color: #E8E8E8; }
+                QTreeView::item:selected { background-color: #CCE4F7; color: #333333; }
+                QHeaderView::section { background-color: #F0F0F0; color: #666666; padding: 4px; border: none; border-right: 1px solid #CCCCCC; border-bottom: 1px solid #CCCCCC; font-weight: bold; font-size: 12px;}
+                QMenu { background-color: #FFFFFF; color: #333333; border: 1px solid #CCCCCC; }
+                QMenu::item:selected { background-color: #CCE4F7; color: #333333; }
+                QListWidget { background-color: #FFFFFF; color: #333333; border: 1px solid #CCCCCC; }
+                QListWidget::item:selected { background-color: #CCE4F7; }
+                QCheckBox { color: #333333; }
+            """)
     
     def closeEvent(self, event):
         """关闭窗口时隐藏到托盘而不是真正关闭"""
@@ -4049,6 +4207,292 @@ class DashboardV2(QMainWindow):
         if sys.platform == 'darwin':
             self._update_macos_dock_visibility()
         super().showEvent(event)
+
+
+# ============================================================================
+# 项目时间线视图组件
+# ============================================================================
+
+def format_duration(seconds):
+    """格式化时长（秒）为可读字符串"""
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    
+    if hours > 0:
+        return f"{hours}小时{minutes}分钟"
+    else:
+        return f"{minutes}分钟"
+
+
+def format_time(sec):
+    """格式化秒数为 HH:MM 格式"""
+    hours = int(sec // 3600)
+    minutes = int((sec % 3600) // 60)
+    return f"{hours:02d}:{minutes:02d}"
+
+
+class RecordWidget(QWidget):
+    """
+    单条活动记录组件
+    """
+    
+    def __init__(self, record):
+        super().__init__()
+        self.record = record
+        
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(80, 2, 10, 2)
+        layout.setSpacing(10)
+        
+        # 时间
+        time_lbl = QLabel(f"{record.get('start_time', 'N/A')} - {record.get('end_time', 'N/A')}")
+        time_lbl.setStyleSheet("color: #AAA; font-size: 10px; min-width: 120px;")
+        layout.addWidget(time_lbl)
+        
+        # 应用
+        app_lbl = QLabel(f"{record.get('app_name', 'N/A')}")
+        app_lbl.setStyleSheet("color: #CCC; font-size: 10px; min-width: 100px;")
+        layout.addWidget(app_lbl)
+        
+        # 文件
+        file_path = record.get('file_path', '')
+        if file_path:
+            file_name = os.path.basename(file_path) if not file_path.startswith('[') else file_path
+            file_lbl = QLabel(f"{file_name}")
+        else:
+            file_lbl = QLabel("-")
+        file_lbl.setStyleSheet("color: #888; font-size: 10px;")
+        file_lbl.setWordWrap(True)
+        layout.addWidget(file_lbl)
+        
+        layout.addStretch()
+
+
+class TimeSlotWidget(QWidget):
+    """
+    时间段组件（最底层）
+    显示一个时间段的详细信息
+    """
+    
+    def __init__(self, start_time, end_time, duration, apps_used, records):
+        super().__init__()
+        self.is_expanded = False
+        self.records = records
+        
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(60, 2, 2, 2)
+        layout.setSpacing(2)
+        
+        # 头
+        header = QPushButton()
+        header.setCheckable(False)
+        
+        duration_str = format_duration(duration)
+        apps_str = ', '.join(apps_used) if isinstance(apps_used, set) else apps_used
+        header.setText(f"▶ {start_time} - {end_time}  ({duration_str})  -  {apps_str}")
+        header.setStyleSheet("""
+            QPushButton {
+                background-color: #2A2A2A;
+                color: #808080;
+                font-size: 11px;
+                padding: 4px 8px;
+                border: 1px solid #3E3E3E;
+                border-radius: 3px;
+                text-align: left;
+            }
+            QPushButton:hover {
+                background-color: #3E3E3E;
+            }
+        """)
+        header.clicked.connect(self.show_details)
+        layout.addWidget(header)
+        
+        # 记录数标签
+        self.lbl_records = QLabel(f"📄 {len(records)} 条记录")
+        self.lbl_records.setStyleSheet("color: #888; font-size: 10px; padding-left: 20px;")
+        self.lbl_records.mousePressEvent = self.show_details
+        layout.addWidget(self.lbl_records)
+        
+        # 详情（默认隐藏）
+        self.detail_widget = QWidget()
+        self.detail_layout = QVBoxLayout(self.detail_widget)
+        self.detail_layout.setContentsMargins(0, 0, 0, 0)
+        self.detail_layout.setSpacing(2)
+        self.detail_widget.setVisible(False)
+        layout.addWidget(self.detail_widget)
+    
+    def show_details(self, event=None):
+        """展开查看详细记录"""
+        if self.detail_widget.isVisible():
+            self.detail_widget.setVisible(False)
+        else:
+            # 清空并重新添加
+            for i in reversed(range(self.detail_layout.count())):
+                widget = self.detail_layout.itemAt(i).widget()
+                if widget:
+                    widget.deleteLater()
+            
+            # 为每条记录创建组件
+            for log in self.records:
+                record_widget = RecordWidget(log)
+                self.detail_layout.addWidget(record_widget)
+            
+            self.detail_widget.setVisible(True)
+
+
+class ProjectTreeNodeWidget(QWidget):
+    """
+    项目树节点组件
+    支持 3 层：祖父项目、父项目、子项目
+    """
+    
+    def __init__(self, name, level, total_duration, time_range, children=None, time_slots=None, record_count=0):
+        super().__init__()
+        self.level = level  # 0, 1, 2
+        self.is_expanded = True
+        self.children = children or {}
+        self.time_slots = time_slots or []
+        self.record_count = record_count
+        
+        # 根据层级设置样式
+        if level == 0:
+            self.bg_color = "#2A2A2A"  # 深色背景
+            self.font_size = 13
+            self.icon = ""
+            self.prefix = ""
+        elif level == 1:
+            self.bg_color = "#2F2F2F"
+            self.font_size = 12
+            self.icon = ""
+            self.prefix = "  "
+        else:
+            self.bg_color = "#343434"
+            self.font_size = 11
+            self.icon = ""
+            self.prefix = "    "
+        
+        # 创建 UI
+        self.setup_ui(name, total_duration, time_range)
+    
+    def setup_ui(self, name, total_duration, time_range):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 2, 2, 2)
+        layout.setSpacing(2)
+        
+        # 头按钮（可点击展开/折叠）
+        header = QPushButton()
+        header.setCheckable(True)
+        header.setChecked(True)
+        
+        # 格式化时长
+        duration_str = format_duration(total_duration)
+        
+        # 根据是否有子节点或时间段决定图标
+        has_children = len(self.children) > 0 or len(self.time_slots) > 0
+        icon = "▼" if has_children else "•"
+        
+        header.setText(f"{self.prefix}{icon} {self.icon} {name}  |  {duration_str}  |  {time_range}")
+        header.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {self.bg_color};
+                color: #CCCCCC;
+                font-size: {self.font_size}px;
+                padding: 6px 8px;
+                border: 1px solid #3E3E3E;
+                border-radius: 3px;
+                text-align: left;
+                font-weight: {'bold' if self.level == 0 else 'normal'};
+            }}
+            QPushButton:hover {{
+                background-color: #3E3E3E;
+            }}
+            QPushButton:checked {{
+                background-color: {self.bg_color};
+                border-bottom-left-radius: 0;
+                border-bottom-right-radius: 0;
+            }}
+        """)
+        
+        header.clicked.connect(self.toggle_expand)
+        layout.addWidget(header)
+        
+        # 子容器
+        self.children_container = QWidget()
+        self.children_layout = QVBoxLayout(self.children_container)
+        self.children_layout.setContentsMargins(0, 0, 0, 0)
+        self.children_layout.setSpacing(2)
+        layout.addWidget(self.children_container)
+        
+        # 填充子节点或时间段
+        self.populate_children()
+    
+    def populate_children(self):
+        """填充子节点或时间段"""
+        # 先添加子项目
+        for child_name, child_data in self.children.items():
+            if 'children' in child_data:
+                # 还有下一层
+                child_widget = ProjectTreeNodeWidget(
+                    name=child_name,
+                    level=self.level + 1,
+                    total_duration=child_data['total_duration'],
+                    time_range=child_data['time_range'],
+                    children=child_data.get('children', {}),
+                    time_slots=child_data.get('time_slots', []),
+                    record_count=child_data.get('record_count', 0)
+                )
+                self.children_layout.addWidget(child_widget)
+            else:
+                # 最底层，添加时间段
+                child_widget = ProjectTreeNodeWidget(
+                    name=child_name,
+                    level=self.level + 1,
+                    total_duration=child_data['total_duration'],
+                    time_range=child_data['time_range'],
+                    time_slots=child_data.get('time_slots', []),
+                    record_count=child_data.get('record_count', 0)
+                )
+                self.children_layout.addWidget(child_widget)
+        
+        # 添加时间段（如果是最底层）
+        if not self.children and self.time_slots:
+            for slot in self.time_slots:
+                start_time = format_time(slot['start_sec'])
+                end_time = format_time(slot['end_sec'])
+                duration = slot['end_sec'] - slot['start_sec']
+                apps = slot['apps']
+                
+                # 准备记录数据
+                records = []
+                for log in slot['logs']:
+                    # 解析日志时间
+                    from datetime import datetime as dt_module
+                    try:
+                        ts = dt_module.fromisoformat(log['timestamp'].split('.')[0])
+                        log_start = format_time(ts.hour * 3600 + ts.minute * 60 + ts.second)
+                        log_end = format_time(log_start.split(':')[0] * 3600 + log_start.split(':')[1] * 60 + log['duration'])
+                    except:
+                        log_start = "N/A"
+                        log_end = "N/A"
+                    
+                    records.append({
+                        'start_time': log_start,
+                        'end_time': log_end,
+                        'app_name': log['app_name'],
+                        'file_path': log['file_path']
+                    })
+                
+                slot_widget = TimeSlotWidget(start_time, end_time, duration, apps, records)
+                self.children_layout.addWidget(slot_widget)
+    
+    def toggle_expand(self):
+        self.is_expanded = not self.is_expanded
+        self.children_container.setVisible(self.is_expanded)
+
+
+# ============================================================================
+# 主程序入口
+# ============================================================================
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)

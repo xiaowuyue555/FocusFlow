@@ -1273,3 +1273,396 @@ def get_projects_with_subprojects():
     result.append(('未分配', '未分配'))
     
     return result
+
+
+def get_project_tree(max_level=2):
+    """
+    获取完整的项目树结构（支持最多 3 层）
+    
+    Args:
+        max_level: 最大层级，0=只有根，1=根 + 子，2=根 + 子 + 孙（默认）
+    
+    Returns:
+        list: 项目树列表，每个节点包含 id, name, children
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    # 使用递归查询构建项目树
+    cursor.execute("""
+        WITH RECURSIVE project_tree AS (
+            -- 第 1 层：根项目
+            SELECT 
+                id, 
+                project_name, 
+                parent_id, 
+                0 as level,
+                CAST(id AS TEXT) as path
+            FROM projects
+            WHERE parent_id IS NULL
+            
+            UNION ALL
+            
+            -- 递归：子项目
+            SELECT 
+                p.id, 
+                p.project_name, 
+                p.parent_id, 
+                pt.level + 1,
+                pt.path || '.' || CAST(p.id AS TEXT)
+            FROM projects p
+            INNER JOIN project_tree pt ON p.parent_id = pt.id
+            WHERE pt.level < ?
+        )
+        SELECT id, project_name, parent_id, level, path 
+        FROM project_tree
+        ORDER BY path
+    """, (max_level,))
+    
+    rows = cursor.fetchall()
+    conn.close()
+    
+    # 构建树结构
+    tree = []
+    node_map = {}
+    
+    for row in rows:
+        project_id, name, parent_id, level, path = row
+        node = {
+            'id': project_id,
+            'name': name,
+            'level': level,
+            'children': []
+        }
+        node_map[project_id] = node
+        
+        if parent_id is None:
+            tree.append(node)
+        elif parent_id in node_map:
+            node_map[parent_id]['children'].append(node)
+    
+    return tree
+
+
+def get_project_path(project_id, project_tree):
+    """
+    获取项目的完整路径（从根到当前节点）
+    
+    Args:
+        project_id: 项目 ID
+        project_tree: 项目树
+    
+    Returns:
+        list: 项目名称列表，如 ['项目 A', 'V1 版本', '粗剪']
+    """
+    def find_path(node, target_id, path):
+        if node['id'] == target_id:
+            return path + [node['name']]
+        
+        for child in node['children']:
+            result = find_path(child, target_id, path + [node['name']])
+            if result:
+                return result
+        
+        return None
+    
+    for root in project_tree:
+        path = find_path(root, project_id, [])
+        if path:
+            return path
+    
+    return []
+
+
+def get_daily_logs_with_projects(date_str):
+    """
+    获取指定日期的所有活动记录，并匹配项目信息
+    
+    Args:
+        date_str: 日期字符串 'YYYY-MM-DD'
+    
+    Returns:
+        list: 活动记录列表，每条记录包含项目路径信息
+    """
+    from datetime import datetime as dt_module, timedelta
+    
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    # 计算日期范围
+    day_start = f"{date_str} 00:00:00"
+    next_day = (dt_module.strptime(date_str, '%Y-%m-%d') + timedelta(days=1)).strftime('%Y-%m-%d')
+    day_end = f"{next_day} 00:00:00"
+    
+    # 查询活动记录并匹配项目
+    cursor.execute("""
+        SELECT 
+            a.timestamp,
+            a.duration,
+            a.app_name,
+            a.file_path,
+            fa.project_id,
+            p.project_name,
+            p.parent_id as project_parent_id
+        FROM activity_log a
+        LEFT JOIN file_assignment fa ON a.file_path = fa.file_path
+        LEFT JOIN projects p ON fa.project_id = p.id
+        WHERE a.timestamp >= ? AND a.timestamp < ?
+        ORDER BY a.timestamp
+    """, (day_start, day_end))
+    
+    rows = cursor.fetchall()
+    conn.close()
+    
+    # 获取项目树
+    project_tree = get_project_tree()
+    
+    # 构建结果
+    logs = []
+    for row in rows:
+        timestamp, duration, app, file_path, project_id, project_name, parent_id = row
+        
+        # 获取项目路径
+        if project_id:
+            project_path = get_project_path(project_id, project_tree)
+        else:
+            project_path = ['未分配', '未分类']
+        
+        logs.append({
+            'timestamp': timestamp,
+            'duration': duration,
+            'app_name': app,
+            'file_path': file_path,
+            'project_id': project_id,
+            'project_name': project_name,
+            'project_path': project_path
+        })
+    
+    return logs
+
+
+def aggregate_logs_by_threshold(logs, threshold_minutes=15):
+    """
+    按时间阈值聚合活动记录
+    
+    Args:
+        logs: 活动记录列表
+        threshold_minutes: 间隔阈值（分钟）
+    
+    Returns:
+        list: 聚合后的时间段列表
+    """
+    if not logs:
+        return []
+    
+    from datetime import datetime as dt_module
+    
+    threshold_seconds = threshold_minutes * 60
+    
+    # 按时间排序
+    sorted_logs = sorted(logs, key=lambda x: x['timestamp'])
+    
+    # 解析时间并聚合
+    time_slots = []
+    current_slot = None
+    
+    for log in sorted_logs:
+        try:
+            # 解析时间戳
+            timestamp_str = log['timestamp']
+            dtime = dt_module.fromisoformat(timestamp_str.split('.')[0])
+            start_sec = dtime.hour * 3600 + dtime.minute * 60 + dtime.second
+            end_sec = start_sec + log['duration']
+            
+            if current_slot is None:
+                # 创建第一个时间段
+                current_slot = {
+                    'start_sec': start_sec,
+                    'end_sec': end_sec,
+                    'logs': [log],
+                    'apps': {log['app_name']},
+                    'files': {log['file_path']} if log['file_path'] else set()
+                }
+            else:
+                # 检查间隔是否小于阈值
+                gap = start_sec - current_slot['end_sec']
+                
+                if gap <= threshold_seconds:
+                    # 合并到当前时间段
+                    current_slot['end_sec'] = max(current_slot['end_sec'], end_sec)
+                    current_slot['logs'].append(log)
+                    current_slot['apps'].add(log['app_name'])
+                    if log['file_path']:
+                        current_slot['files'].add(log['file_path'])
+                else:
+                    # 创建新的时间段
+                    time_slots.append(current_slot)
+                    current_slot = {
+                        'start_sec': start_sec,
+                        'end_sec': end_sec,
+                        'logs': [log],
+                        'apps': {log['app_name']},
+                        'files': {log['file_path']} if log['file_path'] else set()
+                    }
+        except Exception as e:
+            print(f"聚合日志时出错：{e}")
+            continue
+    
+    # 添加最后一个时间段
+    if current_slot:
+        time_slots.append(current_slot)
+    
+    return time_slots
+
+
+def aggregate_project_timeline(date_str, threshold_minutes=15):
+    """
+    聚合项目时间线（支持 3 层项目结构）
+    
+    Args:
+        date_str: 日期字符串 'YYYY-MM-DD'
+        threshold_minutes: 间隔阈值（分钟）
+    
+    Returns:
+        dict: 聚合后的项目时间线数据
+    """
+    # 获取当天所有活动记录
+    logs = get_daily_logs_with_projects(date_str)
+    
+    if not logs:
+        return {}
+    
+    # 按项目路径分组（只保留最底层项目）
+    grouped = {}
+    for log in logs:
+        project_path = tuple(log['project_path'])
+        if project_path not in grouped:
+            grouped[project_path] = []
+        grouped[project_path].append(log)
+    
+    # 对每个最底层项目，按阈值聚合时间段
+    result = {}
+    for project_path, proj_logs in grouped.items():
+        # 聚合成时间段
+        time_slots = aggregate_logs_by_threshold(proj_logs, threshold_minutes)
+        
+        if not time_slots:
+            continue
+        
+        # 计算统计信息
+        total_duration = sum(slot['end_sec'] - slot['start_sec'] for slot in time_slots)
+        start_time = min(slot['start_sec'] for slot in time_slots)
+        end_time = max(slot['end_sec'] for slot in time_slots)
+        
+        # 格式化时间
+        def format_time(sec):
+            hours = int(sec // 3600)
+            minutes = int((sec % 3600) // 60)
+            return f"{hours:02d}:{minutes:02d}"
+        
+        result[project_path] = {
+            'total_duration': total_duration,
+            'time_range': f"{format_time(start_time)}-{format_time(end_time)}",
+            'time_slots': time_slots,
+            'record_count': len(proj_logs)
+        }
+    
+    return result
+
+
+def build_project_timeline_tree(timeline_data):
+    """
+    将扁平的项目时间线数据构建成树形结构
+    
+    Args:
+        timeline_data: aggregate_project_timeline 返回的数据
+    
+    Returns:
+        dict: 树形结构的项目时间线
+    """
+    tree = {}
+    
+    # 按项目路径长度排序，先处理短的（上层）
+    sorted_paths = sorted(timeline_data.keys(), key=len)
+    
+    for project_path in sorted_paths:
+        data = timeline_data[project_path]
+        
+        # 根据路径长度确定层级
+        if len(project_path) == 1:
+            # 只有 1 层：根项目
+            root_name = project_path[0]
+            if root_name not in tree:
+                tree[root_name] = {
+                    'name': root_name,
+                    'total_duration': 0,
+                    'time_range': data['time_range'],
+                    'children': {}
+                }
+            tree[root_name]['total_duration'] += data['total_duration']
+            
+        elif len(project_path) == 2:
+            # 2 层：根项目 → 子项目
+            root_name = project_path[0]
+            child_name = project_path[1]
+            
+            if root_name not in tree:
+                tree[root_name] = {
+                    'name': root_name,
+                    'total_duration': 0,
+                    'time_range': data['time_range'],
+                    'children': {}
+                }
+            
+            if child_name not in tree[root_name]['children']:
+                tree[root_name]['children'][child_name] = {
+                    'name': child_name,
+                    'total_duration': 0,
+                    'time_range': data['time_range'],
+                    'time_slots': [],
+                    'record_count': 0
+                }
+            
+            tree[root_name]['children'][child_name]['total_duration'] += data['total_duration']
+            tree[root_name]['children'][child_name]['time_slots'] = data['time_slots']
+            tree[root_name]['children'][child_name]['record_count'] += data['record_count']
+            tree[root_name]['total_duration'] += data['total_duration']
+            
+        elif len(project_path) == 3:
+            # 3 层：根项目 → 子项目 → 孙项目
+            root_name = project_path[0]
+            child_name = project_path[1]
+            grandchild_name = project_path[2]
+            
+            if root_name not in tree:
+                tree[root_name] = {
+                    'name': root_name,
+                    'total_duration': 0,
+                    'time_range': data['time_range'],
+                    'children': {}
+                }
+            
+            if child_name not in tree[root_name]['children']:
+                tree[root_name]['children'][child_name] = {
+                    'name': child_name,
+                    'total_duration': 0,
+                    'time_range': data['time_range'],
+                    'children': {}
+                }
+            
+            if grandchild_name not in tree[root_name]['children'][child_name]['children']:
+                tree[root_name]['children'][child_name]['children'][grandchild_name] = {
+                    'name': grandchild_name,
+                    'total_duration': 0,
+                    'time_range': data['time_range'],
+                    'time_slots': [],
+                    'record_count': 0
+                }
+            
+            tree[root_name]['children'][child_name]['children'][grandchild_name]['total_duration'] += data['total_duration']
+            tree[root_name]['children'][child_name]['children'][grandchild_name]['time_slots'] = data['time_slots']
+            tree[root_name]['children'][child_name]['children'][grandchild_name]['record_count'] += data['record_count']
+            tree[root_name]['children'][child_name]['total_duration'] += data['total_duration']
+            tree[root_name]['total_duration'] += data['total_duration']
+    
+    return tree
