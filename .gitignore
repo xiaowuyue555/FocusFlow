@@ -37,7 +37,7 @@ $RECYCLE.BIN/
 logs/
 
 # Database (optional - include if you want to track schema only)
-# data/*.db
+data/*.db
 data/tracker.db-shm
 data/tracker.db-wal
 
@@ -57,3 +57,4 @@ htmlcov/
 *.tmp
 *.bak
 *.temp
+data/tracker.db

@@ -1,0 +1,7 @@
+# macOS 依赖
+customtkinter
+psutil
+pandas
+pyobjc-framework-Quartz
+pyobjc-framework-ApplicationServices
+matplotlib

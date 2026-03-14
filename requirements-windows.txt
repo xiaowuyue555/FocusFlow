@@ -1,0 +1,6 @@
+# Windows 依赖
+customtkinter
+psutil
+pandas
+pywin32
+matplotlib
