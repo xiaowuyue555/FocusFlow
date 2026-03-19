@@ -2734,6 +2734,11 @@ class DashboardV2(QMainWindow):
         self.tree_projects = QTreeView()
         self.tree_projects.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.tree_projects.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.tree_projects.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.tree_projects.setDragEnabled(True)
+        self.tree_projects.setAcceptDrops(True)
+        self.tree_projects.setDropIndicatorShown(True)
+        self.tree_projects.setDragDropMode(QAbstractItemView.DragDrop)
         self.tree_projects.setContextMenuPolicy(Qt.CustomContextMenu)
         self.tree_projects.customContextMenuRequested.connect(self.show_project_menu)
         left_layout.addWidget(self.tree_projects)
@@ -3512,7 +3517,10 @@ class DashboardV2(QMainWindow):
             else:
                 menu.addAction("归档项目").triggered.connect(lambda: self.action_archive_project(project_id))
             menu.addAction("删除").triggered.connect(lambda: self.action_delete_project(project_id))
-
+            menu.addSeparator()
+            menu.addAction("📤 导出项目和规则...").triggered.connect(self.action_export_projects)
+            menu.addAction("📥 导入项目和规则...").triggered.connect(self.action_import_projects)
+        
         menu.exec_(self.tree_projects.viewport().mapToGlobal(pos))
 
     def show_inbox_menu(self, pos):
@@ -4223,7 +4231,53 @@ class DashboardV2(QMainWindow):
             # 更新托盘菜单文本
             if hasattr(self, 'system_tray'):
                 self.system_tray.update_menu_texts()
-    
+
+    def dragEnterEvent(self, event):
+        """处理拖拽进入事件"""
+        if event.mimeData().hasFormat('application/x-qabstractitemmodeldatalist'):
+            event.acceptProposedAction()
+
+    def dragMoveEvent(self, event):
+        """处理拖拽移动事件"""
+        if event.mimeData().hasFormat('application/x-qabstractitemmodeldatalist'):
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        """处理拖拽放置事件"""
+        if event.mimeData().hasFormat('application/x-qabstractitemmodeldatalist'):
+            # 获取拖拽的项目
+            source_index = self.tree_projects.currentIndex()
+            if not source_index.isValid():
+                return
+            
+            # 获取目标项目
+            target_index = self.tree_projects.indexAt(event.pos())
+            if not target_index.isValid():
+                # 拖放到空白区域，设为根项目
+                target_id = None
+            else:
+                # 获取目标项目的ID
+                target_item = self.model_projects.itemFromIndex(target_index)
+                target_id = target_item.data(Qt.UserRole + 1)
+            
+            # 获取源项目的ID
+            source_item = self.model_projects.itemFromIndex(source_index)
+            source_id = source_item.data(Qt.UserRole + 1)
+            
+            # 防止循环依赖
+            if source_id == target_id:
+                return
+            
+            # 调用move_project函数
+            from core.project_tree import move_project
+            success = move_project(source_id, target_id)
+            
+            if success:
+                # 刷新项目树
+                self.refresh_data()
+            
+            event.acceptProposedAction()
+
     def changeEvent(self, event):
         """处理窗口状态变化（最小化等）"""
         if event.type() == event.Type.WindowStateChange:
@@ -4248,6 +4302,84 @@ class DashboardV2(QMainWindow):
         if sys.platform == 'darwin':
             self._update_macos_dock_visibility()
         super().showEvent(event)
+
+    def action_export_projects(self):
+        """导出项目和规则"""
+        from PySide6.QtWidgets import QFileDialog
+        from core.export import export_projects_and_rules
+        from datetime import datetime
+        
+        # 打开文件选择对话框
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "导出项目和规则",
+            f"projects_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+            "JSON Files (*.json)"
+        )
+        
+        if file_path:
+            result = export_projects_and_rules(file_path)
+            if result['success']:
+                QMessageBox.information(
+                    self,
+                    "导出成功",
+                    f"成功导出 {result['project_count']} 个项目和 {result['rule_count']} 条规则到\n{result['file_path']}"
+                )
+            else:
+                QMessageBox.warning(
+                    self,
+                    "导出失败",
+                    f"导出失败：{result.get('error', '未知错误')}"
+                )
+
+    def action_import_projects(self):
+        """导入项目和规则"""
+        from PySide6.QtWidgets import QFileDialog, QInputDialog, QMessageBox
+        from core.export import import_projects_and_rules
+        
+        # 打开文件选择对话框
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "导入项目和规则",
+            "",
+            "JSON Files (*.json)"
+        )
+        
+        if file_path:
+            # 选择冲突处理策略
+            strategies = ["跳过 (保留现有)", "覆盖 (替换现有)", "重命名 (创建新副本)"]
+            strategy_map = {
+                "跳过 (保留现有)": "skip",
+                "覆盖 (替换现有)": "overwrite",
+                "重命名 (创建新副本)": "rename"
+            }
+            
+            strategy, ok = QInputDialog.getItem(
+                self,
+                "选择冲突处理策略",
+                "当项目名称冲突时：",
+                strategies,
+                0,
+                False
+            )
+            
+            if ok:
+                result = import_projects_and_rules(file_path, strategy_map[strategy])
+                if result['success']:
+                    QMessageBox.information(
+                        self,
+                        "导入成功",
+                        f"成功导入 {result['imported_projects']} 个项目和 {result['imported_rules']} 条规则\n" 
+                        f"跳过了 {result['skipped_projects']} 个已存在的项目"
+                    )
+                    # 刷新项目树
+                    self.refresh_data()
+                else:
+                    QMessageBox.warning(
+                        self,
+                        "导入失败",
+                        f"导入失败：{result.get('error', '未知错误')}"
+                    )
 
 
 # ============================================================================
