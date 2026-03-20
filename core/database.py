@@ -180,6 +180,17 @@ def init_db():
          timestamp DATETIME,
          archived_at DATETIME,
          action TEXT)''')  # action: 'deleted' 或 'merged'
+    
+    # 10. 智能提取规则表
+    cursor.execute('''CREATE TABLE IF NOT EXISTS extraction_rules
+        (id INTEGER PRIMARY KEY AUTOINCREMENT,
+         rule_name TEXT,
+         rule_type TEXT,
+         match_pattern TEXT,
+         project_id INTEGER,
+         priority INTEGER DEFAULT 0,
+         created_at DATETIME,
+         FOREIGN KEY (project_id) REFERENCES projects(id))''')
 
     # 初始化默认配置 (如果不存在的话)
     cursor.execute("INSERT OR IGNORE INTO system_config (key, value) VALUES ('idle_threshold', '30')")
@@ -201,6 +212,12 @@ def init_db():
     # 4. 复合索引 - 优化同时使用时间和路径的查询
     cursor.execute('''CREATE INDEX IF NOT EXISTS idx_activity_log_timestamp_path 
                       ON activity_log(timestamp, file_path)''')
+    
+    # 5. 规则表索引
+    cursor.execute('''CREATE INDEX IF NOT EXISTS idx_extraction_rules_project 
+                      ON extraction_rules(project_id)''')
+    cursor.execute('''CREATE INDEX IF NOT EXISTS idx_extraction_rules_type 
+                      ON extraction_rules(rule_type)''')
     
     conn.commit()
     conn.close()

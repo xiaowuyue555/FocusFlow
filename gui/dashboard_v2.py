@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
     QSplitter, QTreeView, QHeaderView, QLabel, QPushButton, QMenu,
     QAbstractItemView, QDialog, QComboBox, QDialogButtonBox, QMessageBox, 
     QInputDialog, QSpinBox, QFormLayout, QGroupBox, QCheckBox, QListWidget, QListWidgetItem,QFileDialog, QFrame, QSizePolicy, QScrollArea,
-    QTableWidget, QTableWidgetItem, QHeaderView, QTabWidget, QDateEdit
+    QTableWidget, QTableWidgetItem, QHeaderView, QTabWidget, QDateEdit, QLineEdit
 )
 from PySide6.QtGui import QStandardItemModel, QStandardItem, QFont, QPainter, QColor, QPen, QBrush, QIcon, QAction, QPixmap
 from PySide6.QtCore import Qt, QModelIndex, QTimer, QItemSelectionModel
@@ -2876,6 +2876,11 @@ class DashboardV2(QMainWindow):
         self.btn_assign_selected.setEnabled(False)
         inbox_action_bar.addWidget(self.btn_assign_selected)
         
+        self.btn_direct_assign = QPushButton("直接分配")
+        self.btn_direct_assign.clicked.connect(self.action_direct_assign)
+        self.btn_direct_assign.setEnabled(False)
+        inbox_action_bar.addWidget(self.btn_direct_assign)
+        
         self.btn_clear_selection = QPushButton("取消选择")
         self.btn_clear_selection.clicked.connect(self.clear_inbox_selection)
         self.btn_clear_selection.setEnabled(False)
@@ -2884,6 +2889,11 @@ class DashboardV2(QMainWindow):
         self.btn_view_fragments = QPushButton("🗑 查看碎片记录")
         self.btn_view_fragments.clicked.connect(self.show_fragment_dialog)
         inbox_action_bar.addWidget(self.btn_view_fragments)
+        
+        self.btn_extract_rules = QPushButton("智能提取规则")
+        self.btn_extract_rules.clicked.connect(self.show_extract_rules_dialog)
+        self.btn_extract_rules.setEnabled(False)
+        inbox_action_bar.addWidget(self.btn_extract_rules)
         
         right_layout.addLayout(inbox_action_bar)
 
@@ -2913,6 +2923,8 @@ class DashboardV2(QMainWindow):
         
         # 【新增】监听选择变化
         self.tree_inbox.selectionModel().selectionChanged.connect(self.on_inbox_selection_changed)
+        # 监听左边项目列表的选择变化
+        self.tree_projects.selectionModel().selectionChanged.connect(self.on_project_selection_changed)
         
         # 【新增】Inbox 分组视图状态管理
         self.inbox_expanded_apps = set()  # 记录展开的程序名
@@ -3099,17 +3111,26 @@ class DashboardV2(QMainWindow):
             conn.close()
 
     def _auto_assign_from_rules(self):
+        """根据 project_map 表的规则自动分配文件到项目"""
         conn = get_connection()
+        
+        # 获取所有项目的自动分配规则
         rules = conn.execute("SELECT project_id, rule_path FROM project_map WHERE rule_path IS NOT NULL AND rule_path != ''").fetchall()
+        
         if rules:
+            # 获取未分配的文件
             unassigned = conn.execute("SELECT DISTINCT file_path FROM activity_log WHERE file_path NOT IN (SELECT file_path FROM file_assignment)").fetchall()
+            
             for (fpath,) in unassigned:
                 if not fpath: continue
+                
+                # 检查每个规则
                 for pid, rule in rules:
                     if rule and rule in fpath:
                         conn.execute("INSERT OR IGNORE INTO file_assignment (file_path, project_id, assigned_at) VALUES (?, ?, ?)", 
                                      (fpath, pid, datetime.now().isoformat()))
                         break
+        
         conn.commit()
         conn.close()
     def _update_top_stats(self):
@@ -4060,11 +4081,31 @@ class DashboardV2(QMainWindow):
         self.lbl_inbox_selected.setText(f"已选中 {count} 个文件")
         self.btn_assign_selected.setEnabled(count > 0)
         self.btn_clear_selection.setEnabled(count > 0)
+        self.btn_extract_rules.setEnabled(count > 0)
+        
+        # 检查左边项目列表的选择状态，启用或禁用直接分配按钮
+        left_selected_indexes = self.tree_projects.selectionModel().selectedRows()
+        left_selected_count = len(left_selected_indexes)
+        
+        # 只有当inbox有选中文件且左边项目列表有且只有一个选中项目时，才启用直接分配按钮
+        self.btn_direct_assign.setEnabled(count > 0 and left_selected_count == 1)
     
     # 【新增】取消选择
     def clear_inbox_selection(self):
         self.tree_inbox.selectionModel().clear()
         self.on_inbox_selection_changed()
+    
+    # 【新增】监听左边项目列表的选择变化
+    def on_project_selection_changed(self):
+        # 当左边项目列表的选择状态改变时，更新直接分配按钮的状态
+        selected_indexes = self.tree_inbox.selectionModel().selectedRows()
+        count = len(selected_indexes)
+        
+        left_selected_indexes = self.tree_projects.selectionModel().selectedRows()
+        left_selected_count = len(left_selected_indexes)
+        
+        # 只有当inbox有选中文件且左边项目列表有且只有一个选中项目时，才启用直接分配按钮
+        self.btn_direct_assign.setEnabled(count > 0 and left_selected_count == 1)
     
     # 【新增】筛选阈值变化
     def on_filter_threshold_changed(self, value):
@@ -4202,6 +4243,267 @@ class DashboardV2(QMainWindow):
             
             QMessageBox.information(self, "完成", f"已将 {count} 个文件分配到项目。")
             self.refresh_data()
+    
+    # 【新增】直接分配功能
+    def action_direct_assign(self):
+        # 检查左边项目列表的选择状态
+        left_selected_indexes = self.tree_projects.selectionModel().selectedRows()
+        if len(left_selected_indexes) != 1:
+            return QMessageBox.warning(self, "提示", "请在左侧项目列表中选择一个项目。")
+        
+        # 获取选中的项目ID
+        left_index = left_selected_indexes[0]
+        left_item = self.model_projects.itemFromIndex(left_index.siblingAtColumn(0))
+        project_id = left_item.data(Qt.UserRole + 1)
+        if not project_id:
+            return QMessageBox.warning(self, "提示", "请选择一个有效的项目。")
+        
+        # 获取inbox中选中的文件路径
+        selected_indexes = self.tree_inbox.selectionModel().selectedRows()
+        file_paths = []
+        for index in selected_indexes:
+            item = self.model_inbox.itemFromIndex(index.siblingAtColumn(0))
+            if item:
+                fpath = item.data(Qt.UserRole + 1)
+                if fpath:  # 有 file_path 说明是文件项，不是分组头
+                    file_paths.append(fpath)
+        
+        if not file_paths:
+            return QMessageBox.warning(self, "提示", "没有选中的文件。")
+        
+        # 确认对话框
+        project_name = left_item.text()
+        reply = QMessageBox.question(
+            self, "直接分配确认",
+            f"确定要将选中的 {len(file_paths)} 个文件直接分配到项目 \"{project_name}\" 吗？",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+        
+        # 执行分配操作
+        conn = get_connection()
+        count = 0
+        for file_path in file_paths:
+            if file_path:
+                conn.execute(
+                    "INSERT OR REPLACE INTO file_assignment (file_path, project_id, assigned_at) VALUES (?, ?, ?)",
+                    (file_path, project_id, datetime.now().isoformat())
+                )
+                count += 1
+        
+        conn.commit()
+        conn.close()
+        
+        QMessageBox.information(self, "完成", f"已将 {count} 个文件直接分配到项目 \"{project_name}\"。")
+        self.clear_inbox_selection()
+        self.refresh_data()
+    
+    # 【新增】智能提取规则对话框
+    def show_extract_rules_dialog(self):
+        from core import RuleEngine
+        
+        # 获取inbox中选中的文件信息
+        selected_indexes = self.tree_inbox.selectionModel().selectedRows()
+        selected_files = []
+        for index in selected_indexes:
+            item = self.model_inbox.itemFromIndex(index.siblingAtColumn(0))
+            if item:
+                fpath = item.data(Qt.UserRole + 1)
+                if fpath:  # 有 file_path 说明是文件项，不是分组头
+                    app_name = item.data(Qt.UserRole + 2) if item.data(Qt.UserRole + 2) else ""
+                    selected_files.append({'file_path': fpath, 'app_name': app_name})
+        
+        if not selected_files:
+            return QMessageBox.warning(self, "提示", "没有选中的文件。")
+        
+        # 提取可能的规则
+        candidate_rules = set()
+        for file_info in selected_files:
+            app_rules = RuleEngine.extract_rules_from_app_name(file_info['app_name'])
+            file_rules = RuleEngine.extract_rules_from_file_path(file_info['file_path'])
+            candidate_rules.update(app_rules)
+            candidate_rules.update(file_rules)
+        
+        # 创建对话框
+        dlg = QDialog(self)
+        dlg.setWindowTitle("智能提取规则 - 添加到项目")
+        dlg.setMinimumSize(800, 600)
+        
+        layout = QVBoxLayout(dlg)
+        
+        # 说明文字
+        info_label = QLabel("从选中的文件中智能提取规则，并添加到指定项目的自动分配规则中。")
+        info_label.setStyleSheet("color: #666; padding: 10px;")
+        layout.addWidget(info_label)
+        
+        # 规则选择
+        rule_group = QGroupBox("候选规则（点击选择）")
+        rule_layout = QVBoxLayout()
+        
+        self.rule_list = QListWidget()
+        for rule in sorted(candidate_rules):
+            item = QListWidgetItem(rule)
+            self.rule_list.addItem(item)
+        rule_layout.addWidget(self.rule_list)
+        rule_group.setLayout(rule_layout)
+        layout.addWidget(rule_group)
+        
+        # 规则预览
+        preview_group = QGroupBox("规则预览 - 将匹配以下文件")
+        preview_layout = QVBoxLayout()
+        
+        self.preview_table = QTableWidget()
+        self.preview_table.setColumnCount(3)
+        self.preview_table.setHorizontalHeaderLabels(["文件路径", "应用名称", "最后使用时间"])
+        self.preview_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        preview_layout.addWidget(self.preview_table)
+        preview_group.setLayout(preview_layout)
+        layout.addWidget(preview_group)
+        
+        # 目标项目选择
+        project_group = QGroupBox("添加到项目（将保存到该项目的自动分配规则中）")
+        project_layout = QVBoxLayout()
+        
+        self.project_combo = QComboBox()
+        # 添加项目/子项目层级
+        show_archived = self.chk_archived.isChecked()
+        projects_data = get_projects_with_subprojects(show_archived)
+        for project_key, project_name in projects_data:
+            if project_key != '未分配':
+                project_id = int(project_key.replace('project_', ''))
+                self.project_combo.addItem(project_name, project_id)
+        project_layout.addWidget(self.project_combo)
+        project_group.setLayout(project_layout)
+        layout.addWidget(project_group)
+        
+        # 按钮
+        btn_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btn_box.accepted.connect(dlg.accept)
+        btn_box.rejected.connect(dlg.reject)
+        layout.addWidget(btn_box)
+        
+        # 连接信号
+        self.rule_list.itemClicked.connect(self.update_preview)
+        
+        # 初始化预览
+        if self.rule_list.count() > 0:
+            self.rule_list.setCurrentRow(0)
+            self.update_preview_for_project_map()
+        
+        if dlg.exec() == QDialog.Accepted:
+            # 获取选中的规则
+            selected_items = self.rule_list.selectedItems()
+            if not selected_items:
+                return QMessageBox.warning(self, "提示", "请选择一个规则。")
+            
+            rule_pattern = selected_items[0].text()
+            project_id = self.project_combo.currentData()
+            project_name = self.project_combo.currentText()
+            
+            # 保存规则到 project_map 表（项目的自动分配规则）
+            conn = get_connection()
+            conn.execute("INSERT INTO project_map (project_id, rule_path) VALUES (?, ?)", 
+                        (project_id, rule_pattern))
+            conn.commit()
+            conn.close()
+            
+            QMessageBox.information(self, "完成", 
+                f"规则 '{rule_pattern}' 已添加到项目 '{project_name}' 的自动分配规则中。\n\n"
+                f"匹配此规则的文件将自动分配到该项目。")
+            self.refresh_data()
+    
+    # 【新增】更新规则预览（用于 project_map 规则）
+    def update_preview_for_project_map(self):
+        """更新规则预览 - 用于项目自动分配规则"""
+        # 清空预览表
+        self.preview_table.setRowCount(0)
+        
+        # 获取选中的规则
+        selected_items = self.rule_list.selectedItems()
+        if not selected_items:
+            return
+        
+        rule_pattern = selected_items[0].text()
+        
+        # 从数据库获取匹配的文件（project_map 使用简单的路径匹配）
+        conn = get_connection()
+        cursor = conn.cursor()
+        
+        # 查询匹配的文件 - project_map 规则是简单的路径包含匹配
+        cursor.execute("""
+            SELECT DISTINCT file_path, app_name, MAX(timestamp) as last_seen
+            FROM activity_log
+            WHERE file_path LIKE ? OR app_name LIKE ?
+            GROUP BY file_path, app_name
+            ORDER BY last_seen DESC
+            LIMIT 10
+        """, (f"%{rule_pattern}%", f"%{rule_pattern}%"))
+        
+        rows = cursor.fetchall()
+        conn.close()
+        
+        # 填充预览表
+        for row_data in rows:
+            file_path, app_name, last_seen = row_data
+            row = self.preview_table.rowCount()
+            self.preview_table.insertRow(row)
+            
+            self.preview_table.setItem(row, 0, QTableWidgetItem(file_path))
+            self.preview_table.setItem(row, 1, QTableWidgetItem(app_name))
+            
+            # 格式化时间
+            try:
+                time_str = datetime.fromisoformat(last_seen.split('.')[0]).strftime("%Y-%m-%d %H:%M:%S")
+            except:
+                time_str = last_seen
+            self.preview_table.setItem(row, 2, QTableWidgetItem(time_str))
+    
+    # 【新增】更新规则预览（旧方法，保留用于其他功能）
+    def update_preview(self):
+        from core import RuleEngine
+        
+        # 清空预览表
+        self.preview_table.setRowCount(0)
+        
+        # 获取选中的规则
+        selected_items = self.rule_list.selectedItems()
+        if not selected_items:
+            return
+        
+        rule_pattern = selected_items[0].text()
+        
+        # 从数据库获取匹配的文件（简单的路径匹配）
+        conn = get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            SELECT DISTINCT file_path, app_name, MAX(timestamp) as last_seen
+            FROM activity_log
+            WHERE file_path LIKE ? OR app_name LIKE ?
+            GROUP BY file_path, app_name
+            ORDER BY last_seen DESC
+            LIMIT 10
+        """, (f"%{rule_pattern}%", f"%{rule_pattern}%"))
+        
+        rows = cursor.fetchall()
+        conn.close()
+        
+        # 填充预览表
+        for row_data in rows:
+            file_path, app_name, last_seen = row_data
+            row = self.preview_table.rowCount()
+            self.preview_table.insertRow(row)
+            
+            self.preview_table.setItem(row, 0, QTableWidgetItem(file_path))
+            self.preview_table.setItem(row, 1, QTableWidgetItem(app_name))
+            
+            # 格式化时间
+            try:
+                time_str = datetime.fromisoformat(last_seen.split('.')[0]).strftime("%Y-%m-%d %H:%M:%S")
+            except:
+                time_str = last_seen
+            self.preview_table.setItem(row, 2, QTableWidgetItem(time_str))
     
     # 【新增】批量忽略某程序的所有文件
     def action_ignore_app(self, app_name):
