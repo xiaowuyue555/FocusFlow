@@ -1087,7 +1087,8 @@ class DataDashboardWindow(QDialog):
         self.combo_project.addItem("全部", None)  # (显示文本，项目 ID)
         
         # 添加项目/子项目层级
-        projects_data = get_projects_with_subprojects()
+        show_archived = self.chk_archived.isChecked()
+        projects_data = get_projects_with_subprojects(show_archived)
         for project_key, project_name in projects_data:
             if project_key == '未分配':
                 self.combo_project.addItem(project_name, '未分配')
@@ -2816,7 +2817,7 @@ class DashboardV2(QMainWindow):
         self.tree_projects = CustomTreeView(self)
         self.tree_projects.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.tree_projects.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.tree_projects.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.tree_projects.setSelectionMode(QAbstractItemView.ExtendedSelection)  # 支持 Ctrl 加选和 Shift 连选
         self.tree_projects.setDragEnabled(True)
         self.tree_projects.setAcceptDrops(True)
         self.tree_projects.setDropIndicatorShown(True)
@@ -3578,6 +3579,43 @@ class DashboardV2(QMainWindow):
     def show_project_menu(self, pos):
         index = self.tree_projects.indexAt(pos)
         menu = QMenu(self)
+        
+        # 检查是否有选中的项目
+        selected_indexes = self.tree_projects.selectionModel().selectedRows()
+        selected_count = len(selected_indexes)
+        
+        # 检查选中的是项目还是文件
+        selected_items = []
+        has_files = False
+        has_projects = False
+        for idx in selected_indexes:
+            item_node = self.model_projects.itemFromIndex(idx.siblingAtColumn(0))
+            project_id = item_node.data(Qt.UserRole + 1)
+            file_path = item_node.data(Qt.UserRole + 2)
+            if file_path:
+                has_files = True
+                selected_items.append(("file", file_path))
+            elif project_id:
+                has_projects = True
+                selected_items.append(("project", project_id))
+        
+        # 如果有多选，显示批量操作菜单
+        if selected_count > 1:
+            # 如果只选中了项目，显示项目的批量操作
+            if has_projects and not has_files:
+                menu.addAction(f"🗑️ 批量删除选中的 {selected_count} 个项目").triggered.connect(self.action_delete_selected_projects)
+                menu.addAction(f"📦 批量归档选中的 {selected_count} 个项目").triggered.connect(self.action_archive_selected_projects)
+                menu.addSeparator()
+                menu.addAction("📤 导出项目和规则...").triggered.connect(self.action_export_projects)
+            # 如果只选中了文件，显示文件的批量操作
+            elif has_files and not has_projects:
+                menu.addAction(f"↩️ 批量移出选中的 {selected_count} 个文件").triggered.connect(self.action_remove_selected_files)
+            # 如果混合选中了项目和文件，只显示通用操作
+            else:
+                menu.addAction("📤 导出项目和规则...").triggered.connect(self.action_export_projects)
+            menu.exec_(self.tree_projects.viewport().mapToGlobal(pos))
+            return
+        
         if not index.isValid():
             menu.addAction("➕ 新建根项目").triggered.connect(lambda: self.action_new_project(None))
             menu.exec(self.tree_projects.viewport().mapToGlobal(pos))
@@ -3675,6 +3713,48 @@ class DashboardV2(QMainWindow):
             else:
                 print(f"[调试] 调用 refresh_data()")
                 self.refresh_data()
+                
+                # 展开父项目节点，以便用户可以看到新创建的子项目
+                if parent_id is not None:
+                    # 查找父项目节点
+                    def find_parent_item(item, parent_id):
+                        if item.data(Qt.UserRole + 1) == parent_id:
+                            return item
+                        for i in range(item.rowCount()):
+                            child = item.child(i)
+                            result = find_parent_item(child, parent_id)
+                            if result:
+                                return result
+                        return None
+                    
+                    root_item = self.model_projects.invisibleRootItem()
+                    parent_item = find_parent_item(root_item, parent_id)
+                    if parent_item:
+                        # 获取父项目节点的索引
+                        parent_index = self.model_projects.indexFromItem(parent_item)
+                        # 展开该节点
+                        self.tree_projects.expand(parent_index)
+                
+                # 查找并选中新创建的项目
+                def find_new_project_item(item, project_id):
+                    if item.data(Qt.UserRole + 1) == project_id:
+                        return item
+                    for i in range(item.rowCount()):
+                        child = item.child(i)
+                        result = find_new_project_item(child, project_id)
+                        if result:
+                            return result
+                    return None
+                
+                root_item = self.model_projects.invisibleRootItem()
+                new_project_item = find_new_project_item(root_item, project_id)
+                if new_project_item:
+                    # 获取新创建项目的索引
+                    new_project_index = self.model_projects.indexFromItem(new_project_item)
+                    # 选中该项目
+                    from PySide6.QtCore import QItemSelectionModel
+                    self.tree_projects.selectionModel().clearSelection()
+                    self.tree_projects.selectionModel().select(new_project_index, QItemSelectionModel.Select)
     def action_rename_project(self, project_id, old_name):
         new_name, ok = QInputDialog.getText(self, "重命名项目", "新名称：", text=old_name)
         if ok and new_name.strip() and new_name.strip() != old_name:
@@ -3696,6 +3776,65 @@ class DashboardV2(QMainWindow):
         if QMessageBox.question(self, "确认删除", "确定要删除该项目吗？绑定的文件将被退回Inbox。") == QMessageBox.Yes:
             if delete_project(project_id, delete_children=False): self.refresh_data()
             else: QMessageBox.warning(self, "删除失败", "请先删除它包含的子项目！")
+    
+    def action_delete_selected_projects(self):
+        # 获取所有选中的项目 ID
+        selected_indexes = self.tree_projects.selectionModel().selectedRows()
+        project_ids = []
+        for index in selected_indexes:
+            item_node = self.model_projects.itemFromIndex(index.siblingAtColumn(0))
+            project_id = item_node.data(Qt.UserRole + 1)
+            if project_id:
+                project_ids.append(project_id)
+        
+        if not project_ids:
+            return
+        
+        if QMessageBox.question(self, "确认删除", f"确定要删除这 {len(project_ids)} 个项目吗？绑定的文件将被退回Inbox。") == QMessageBox.Yes:
+            for project_id in project_ids:
+                if not delete_project(project_id, delete_children=False):
+                    QMessageBox.warning(self, "删除失败", f"项目 {project_id} 包含子项目，请先删除子项目！")
+                    return
+            self.refresh_data()
+    
+    def action_archive_selected_projects(self):
+        # 获取所有选中的项目 ID
+        selected_indexes = self.tree_projects.selectionModel().selectedRows()
+        project_ids = []
+        for index in selected_indexes:
+            item_node = self.model_projects.itemFromIndex(index.siblingAtColumn(0))
+            project_id = item_node.data(Qt.UserRole + 1)
+            if project_id:
+                project_ids.append(project_id)
+        
+        if not project_ids:
+            return
+        
+        if QMessageBox.question(self, "确认归档", f"确定要归档这 {len(project_ids)} 个项目吗？") == QMessageBox.Yes:
+            for project_id in project_ids:
+                if not archive_project(project_id):
+                    QMessageBox.warning(self, "归档失败", f"项目 {project_id} 包含子项目，只有没有子项目的最底层项目才能归档！")
+                    return
+            self.refresh_data()
+    
+    def action_remove_selected_files(self):
+        # 获取所有选中的文件路径
+        selected_indexes = self.tree_projects.selectionModel().selectedRows()
+        file_paths = []
+        for index in selected_indexes:
+            item_node = self.model_projects.itemFromIndex(index.siblingAtColumn(0))
+            file_path = item_node.data(Qt.UserRole + 2)
+            if file_path:
+                file_paths.append(file_path)
+        
+        if not file_paths:
+            return
+        
+        if QMessageBox.question(self, "确认移出", f"确定要将这 {len(file_paths)} 个文件移出记录，退回Inbox吗？") == QMessageBox.Yes:
+            for file_path in file_paths:
+                remove_file_assignment(file_path)
+            self.refresh_data()
+    
     def action_export_bill(self, project_id, project_name):
         default_name = f"{project_name}_工时明细_{datetime.now().strftime('%Y%m%d')}.xlsx"
         file_path, _ = QFileDialog.getSaveFileName(self, "导出单项目账单", default_name, "Excel Files (*.xlsx)")
@@ -3882,7 +4021,8 @@ class DashboardV2(QMainWindow):
         combo = QComboBox()
         
         # 添加项目/子项目层级
-        projects_data = get_projects_with_subprojects()
+        show_archived = self.chk_archived.isChecked()
+        projects_data = get_projects_with_subprojects(show_archived)
         for project_key, project_name in projects_data:
             if project_key != '未分配':
                 project_id = int(project_key.replace('project_', ''))
@@ -3969,7 +4109,8 @@ class DashboardV2(QMainWindow):
         
         combo = QComboBox()
         # 添加项目/子项目层级
-        projects_data = get_projects_with_subprojects()
+        show_archived = self.chk_archived.isChecked()
+        projects_data = get_projects_with_subprojects(show_archived)
         for project_key, project_name in projects_data:
             if project_key != '未分配':
                 project_id = int(project_key.replace('project_', ''))
@@ -4023,7 +4164,8 @@ class DashboardV2(QMainWindow):
         
         combo = QComboBox()
         # 添加项目/子项目层级
-        projects_data = get_projects_with_subprojects()
+        show_archived = self.chk_archived.isChecked()
+        projects_data = get_projects_with_subprojects(show_archived)
         for project_key, project_name in projects_data:
             if project_key != '未分配':
                 project_id = int(project_key.replace('project_', ''))

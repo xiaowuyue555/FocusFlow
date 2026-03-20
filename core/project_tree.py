@@ -50,7 +50,9 @@ class ProjectNode:
         return len(self.get_ancestors())
     
     def is_leaf(self) -> bool:
-        return len(self._children) == 0
+        # 只考虑未被归档的子项目
+        active_children = [child for child in self._children if not child.is_archived]
+        return len(active_children) == 0
     
     def get_path(self) -> str:
         ancestors = self.get_ancestors()

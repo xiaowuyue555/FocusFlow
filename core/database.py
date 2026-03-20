@@ -1280,9 +1280,12 @@ def get_unique_projects():
     return projects
 
 
-def get_projects_with_subprojects():
+def get_projects_with_subprojects(show_archived=False):
     """
     获取项目/子项目层级结构
+    
+    Args:
+        show_archived: 是否显示已归档的项目
     
     Returns:
         list of tuples: [
@@ -1297,11 +1300,13 @@ def get_projects_with_subprojects():
     conn = get_connection()
     cursor = conn.cursor()
     
-    # 查询所有项目，包括 parent_id
+    # 查询所有项目，包括 parent_id 和归档状态
     cursor.execute("""
-        SELECT id, project_name, parent_id 
-        FROM projects 
-        ORDER BY parent_id, project_name ASC
+        SELECT p.id, p.project_name, p.parent_id, 
+               CASE WHEN pa.project_id IS NOT NULL THEN 1 ELSE 0 END as is_archived
+        FROM projects p
+        LEFT JOIN project_archive pa ON p.id = pa.project_id
+        ORDER BY p.parent_id, p.project_name ASC
     """)
     rows = cursor.fetchall()
     
@@ -1312,10 +1317,14 @@ def get_projects_with_subprojects():
     
     # 首先创建所有项目条目
     for row in rows:
-        project_id, project_name, parent_id = row
+        project_id, project_name, parent_id, is_archived = row
+        # 如果不显示已归档的项目，并且项目已归档，则跳过
+        if not show_archived and is_archived:
+            continue
         projects_dict[project_id] = {
             'name': project_name,
             'parent_id': parent_id,
+            'is_archived': is_archived,
             'children': []
         }
     
