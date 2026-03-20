@@ -1288,6 +1288,7 @@ def get_projects_with_subprojects():
         list of tuples: [
             ('project_1', '项目 1'),  # 父项目
             ('project_1.sub_1', '  ├─ 子项目 1'),  # 子项目
+            ('project_1.sub_1.sub_1', '    ├─ 孙子项目 1'),  # 孙子项目
             ('project_1.sub_2', '  ├─ 子项目 2'),
             ('project_2', '项目 2'),
             ('未分配', '未分配'),
@@ -1308,46 +1309,51 @@ def get_projects_with_subprojects():
     
     # 构建项目树
     projects_dict = {}
+    
+    # 首先创建所有项目条目
     for row in rows:
         project_id, project_name, parent_id = row
-        if project_id not in projects_dict:
-            projects_dict[project_id] = {
-                'name': project_name,
-                'parent_id': parent_id,
-                'children': []
-            }
-        
-        if parent_id is not None:
+        projects_dict[project_id] = {
+            'name': project_name,
+            'parent_id': parent_id,
+            'children': []
+        }
+    
+    # 然后添加子项目到父项目的 children 列表中
+    for project_id, project_data in projects_dict.items():
+        parent_id = project_data['parent_id']
+        if parent_id is not None and parent_id in projects_dict:
             # 这是子项目，添加到父项目的 children 中
-            if parent_id in projects_dict:
-                projects_dict[parent_id]['children'].append(project_id)
-            else:
-                projects_dict[parent_id] = {'name': '', 'parent_id': None, 'children': [project_id]}
+            projects_dict[parent_id]['children'].append(project_id)
     
     # 收集结果
     result = []
+    
+    # 递归添加项目和子项目
+    def add_projects_recursive(project_id, indent=""):
+        project_data = projects_dict.get(project_id)
+        if not project_data or not project_data['name']:
+            return
+        
+        # 添加当前项目
+        result.append((f"project_{project_id}", f"{indent}{project_data['name']}"))
+        
+        # 按名称排序子项目
+        children_ids = project_data['children']
+        if children_ids:
+            children = [(cid, projects_dict[cid]['name']) for cid in children_ids if cid in projects_dict]
+            children.sort(key=lambda x: x[1])
+            
+            # 递归添加子项目
+            for child_id, child_name in children:
+                add_projects_recursive(child_id, f"{indent}  ├─ ")
     
     # 先添加父项目
     parent_projects = [(pid, pdata) for pid, pdata in projects_dict.items() if pdata['parent_id'] is None]
     parent_projects.sort(key=lambda x: x[1]['name'])
     
     for project_id, project_data in parent_projects:
-        project_name = project_data['name']
-        if not project_name:  # 跳过空名称
-            continue
-        
-        # 添加父项目
-        result.append((f"project_{project_id}", project_name))
-        
-        # 添加子项目
-        children_ids = project_data['children']
-        if children_ids:
-            # 按名称排序子项目
-            children = [(cid, projects_dict[cid]['name']) for cid in children_ids if cid in projects_dict]
-            children.sort(key=lambda x: x[1])
-            
-            for child_id, child_name in children:
-                result.append((f"project_{child_id}", f"  ├─ {child_name}"))
+        add_projects_recursive(project_id)
     
     # 添加"未分配"选项
     result.append(('未分配', '未分配'))

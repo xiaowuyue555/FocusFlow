@@ -2371,7 +2371,7 @@ class TimelineWidget(QWidget):
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
             # 检测是否是双击
-            if event.type() == Qt.MouseButtonDblClick:
+            if event.clickCount() == 2:
                 # 显示详情
                 self.show_block_details(event.position().x())
                 return
@@ -2731,7 +2731,89 @@ class DashboardV2(QMainWindow):
         left_header.addWidget(self.chk_archived)
         left_layout.addLayout(left_header)
 
-        self.tree_projects = QTreeView()
+        # 自定义 QTreeView 子类，重写 dropEvent 方法
+        class CustomTreeView(QTreeView):
+            def __init__(self, parent=None):
+                super().__init__(parent)
+                self.parent_window = parent
+            
+            def dropEvent(self, event):
+                if event.mimeData().hasFormat('application/x-qabstractitemmodeldatalist'):
+                    # 获取被拖拽的项目
+                    source_index = self.currentIndex()
+                    if not source_index.isValid():
+                        from PySide6.QtWidgets import QMessageBox
+                        QMessageBox.information(self, "调试", "源索引无效")
+                        return
+                    
+                    # 获取源项目的ID
+                    source_item = self.model().itemFromIndex(source_index)
+                    source_id = source_item.data(Qt.UserRole + 1)
+                    source_name = source_item.text()
+                    if not source_id:
+                        from PySide6.QtWidgets import QMessageBox
+                        QMessageBox.information(self, "调试", f"源项目ID无效: {source_name}")
+                        return
+                    
+                    # 获取目标项目
+                    target_index = self.indexAt(event.pos())
+                    target_id = None
+                    target_name = "根节点"
+                    
+                    if target_index.isValid():
+                        # 获取目标项目的ID
+                        target_item = self.model().itemFromIndex(target_index)
+                        target_id = target_item.data(Qt.UserRole + 1)
+                        target_name = target_item.text()
+                        
+                        # 如果目标是文件，获取其父项目的ID
+                        if not target_id:
+                            parent_item = target_item.parent()
+                            if parent_item:
+                                target_id = parent_item.data(Qt.UserRole + 1)
+                                target_name = f"{parent_item.text()} (文件: {target_name})"
+                            else:
+                                from PySide6.QtWidgets import QMessageBox
+                                QMessageBox.information(self, "调试", f"目标文件没有父项目: {target_name}")
+                                return
+                    
+                    # 防止循环依赖
+                    if source_id == target_id:
+                        from PySide6.QtWidgets import QMessageBox
+                        QMessageBox.information(self, "调试", "源项目和目标项目相同，取消操作")
+                        return
+                    
+                    # 调用move_project函数
+                    from core.project_tree import move_project
+                    from PySide6.QtWidgets import QMessageBox
+                    QMessageBox.information(self, "调试", f"准备移动项目: {source_name} (ID: {source_id}) 到 {target_name} (ID: {target_id})")
+                    
+                    success = move_project(source_id, target_id)
+                    
+                    if success:
+                        QMessageBox.information(self, "调试", "项目移动成功，正在刷新项目树...")
+                        # 强制刷新项目树，不依赖哈希检查
+                        if self.parent_window:
+                            self.parent_window.save_tree_state()
+                            self.parent_window.model_projects.removeRows(0, self.parent_window.model_projects.rowCount())
+                            
+                            show_archived = self.parent_window.chk_archived.isChecked()
+                            tree = load_project_tree()
+                            for root in tree.get_root_nodes():
+                                if not root.is_archived or show_archived:
+                                    self.parent_window._build_project_tree_recursive(root, self.parent_window.model_projects.invisibleRootItem(), show_archived)
+                                    
+                            self.parent_window.restore_tree_state()
+                            self.parent_window.last_tree_hash = None  # 重置哈希值，确保下次刷新时重新计算
+                            QMessageBox.information(self, "调试", "项目树刷新完成")
+                    else:
+                        QMessageBox.information(self, "调试", "项目移动失败")
+                    
+                    event.acceptProposedAction()
+                else:
+                    super().dropEvent(event)
+        
+        self.tree_projects = CustomTreeView(self)
         self.tree_projects.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.tree_projects.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.tree_projects.setSelectionMode(QAbstractItemView.SingleSelection)
@@ -2989,8 +3071,10 @@ class DashboardV2(QMainWindow):
             if pid:
                 # 这是一个项目，获取项目最新总时长
                 stats = get_project_stats(pid, include_children=False)
-                item_total.setText(format_duration(stats['total']))
-                item_today.setText(format_duration(stats['today']))
+                if item_total:
+                    item_total.setText(format_duration(stats['total']))
+                if item_today:
+                    item_today.setText(format_duration(stats['today']))
             elif fpath:
                 # 这是一个文件，直接用 SQL 极速查出它的最新时长
                 # 【性能优化】：使用区间查询替代 DATE() 函数，使索引生效
@@ -3001,8 +3085,10 @@ class DashboardV2(QMainWindow):
                     FROM activity_log WHERE file_path = ?
                 """, (today_start, tomorrow_start, fpath)).fetchone()
                 if row:
-                    item_total.setText(format_duration(row[0]))
-                    item_today.setText(format_duration(row[1]))
+                    if item_total:
+                        item_total.setText(format_duration(row[0]))
+                    if item_today:
+                        item_today.setText(format_duration(row[1]))
             
             # 递归更新子节点
             if item_name.hasChildren():
@@ -3101,9 +3187,14 @@ class DashboardV2(QMainWindow):
                             break
             
             if target_pid:
-                p_name = conn.execute("SELECT project_name FROM projects WHERE id = ?", (target_pid,)).fetchone()[0]
-                stats = get_project_stats(target_pid, include_children=True)
-                p_today, p_total = stats['today'], stats['total']
+                project_row = conn.execute("SELECT project_name FROM projects WHERE id = ?", (target_pid,)).fetchone()
+                if project_row:
+                    p_name = project_row[0]
+                    stats = get_project_stats(target_pid, include_children=True)
+                    p_today, p_total = stats['today'], stats['total']
+                else:
+                    p_name = "未知项目"
+                    p_today, p_total = 0, 0
 
         conn.close()
 
@@ -3574,8 +3665,16 @@ class DashboardV2(QMainWindow):
     def action_new_project(self, parent_id):
         name, ok = QInputDialog.getText(self, "新建项目", "请输入项目名称：")
         if ok and name.strip():
-            create_project(name.strip(), parent_id)
-            self.refresh_data()
+            print(f"[调试] action_new_project: name={name.strip()}, parent_id={parent_id}")
+            project_id = create_project(name.strip(), parent_id)
+            print(f"[调试] create_project 返回值: {project_id}")
+            if project_id is None:
+                from PySide6.QtWidgets import QMessageBox
+                print(f"[调试] 显示警告消息：项目名称已存在")
+                QMessageBox.warning(self, "提示", "该项目名称已存在，请使用其他名称。")
+            else:
+                print(f"[调试] 调用 refresh_data()")
+                self.refresh_data()
     def action_rename_project(self, project_id, old_name):
         new_name, ok = QInputDialog.getText(self, "重命名项目", "新名称：", text=old_name)
         if ok and new_name.strip() and new_name.strip() != old_name:
@@ -4245,36 +4344,75 @@ class DashboardV2(QMainWindow):
     def dropEvent(self, event):
         """处理拖拽放置事件"""
         if event.mimeData().hasFormat('application/x-qabstractitemmodeldatalist'):
-            # 获取拖拽的项目
+            # 获取被拖拽的项目
+            # 在Qt中，当拖拽时，currentIndex()应该是被拖拽的项目
             source_index = self.tree_projects.currentIndex()
             if not source_index.isValid():
+                from PySide6.QtWidgets import QMessageBox
+                QMessageBox.information(self, "调试", "源索引无效")
                 return
-            
-            # 获取目标项目
-            target_index = self.tree_projects.indexAt(event.pos())
-            if not target_index.isValid():
-                # 拖放到空白区域，设为根项目
-                target_id = None
-            else:
-                # 获取目标项目的ID
-                target_item = self.model_projects.itemFromIndex(target_index)
-                target_id = target_item.data(Qt.UserRole + 1)
             
             # 获取源项目的ID
             source_item = self.model_projects.itemFromIndex(source_index)
             source_id = source_item.data(Qt.UserRole + 1)
+            source_name = source_item.text()
+            if not source_id:
+                from PySide6.QtWidgets import QMessageBox
+                QMessageBox.information(self, "调试", f"源项目ID无效: {source_name}")
+                return
+            
+            # 获取目标项目
+            target_index = self.tree_projects.indexAt(event.pos())
+            target_id = None
+            target_name = "根节点"
+            
+            if target_index.isValid():
+                # 获取目标项目的ID
+                target_item = self.model_projects.itemFromIndex(target_index)
+                target_id = target_item.data(Qt.UserRole + 1)
+                target_name = target_item.text()
+                
+                # 如果目标是文件，获取其父项目的ID
+                if not target_id:
+                    parent_item = target_item.parent()
+                    if parent_item:
+                        target_id = parent_item.data(Qt.UserRole + 1)
+                        target_name = f"{parent_item.text()} (文件: {target_name})"
+                    else:
+                        from PySide6.QtWidgets import QMessageBox
+                        QMessageBox.information(self, "调试", f"目标文件没有父项目: {target_name}")
+                        return
             
             # 防止循环依赖
             if source_id == target_id:
+                from PySide6.QtWidgets import QMessageBox
+                QMessageBox.information(self, "调试", "源项目和目标项目相同，取消操作")
                 return
             
             # 调用move_project函数
             from core.project_tree import move_project
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.information(self, "调试", f"准备移动项目: {source_name} (ID: {source_id}) 到 {target_name} (ID: {target_id})")
+            
             success = move_project(source_id, target_id)
             
             if success:
-                # 刷新项目树
-                self.refresh_data()
+                QMessageBox.information(self, "调试", "项目移动成功，正在刷新项目树...")
+                # 强制刷新项目树，不依赖哈希检查
+                self.save_tree_state()
+                self.model_projects.removeRows(0, self.model_projects.rowCount())
+                
+                show_archived = self.chk_archived.isChecked()
+                tree = load_project_tree()
+                for root in tree.get_root_nodes():
+                    if not root.is_archived or show_archived:
+                        self._build_project_tree_recursive(root, self.model_projects.invisibleRootItem(), show_archived)
+                        
+                self.restore_tree_state()
+                self.last_tree_hash = None  # 重置哈希值，确保下次刷新时重新计算
+                QMessageBox.information(self, "调试", "项目树刷新完成")
+            else:
+                QMessageBox.information(self, "调试", "项目移动失败")
             
             event.acceptProposedAction()
 
