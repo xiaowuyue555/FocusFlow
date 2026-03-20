@@ -539,7 +539,8 @@ class ProjectRulesDialog(QDialog):
         text, ok = QInputDialog.getText(self, "添加规则", "输入路径/标题匹配关键词：")
         if ok and text.strip():
             conn = get_connection()
-            conn.execute("INSERT INTO project_map (project_id, rule_path) VALUES (?, ?)", (self.project_id, text.strip()))
+            conn.execute("INSERT INTO project_map (project_id, project_name, rule_path) VALUES (?, ?, ?)", 
+                        (self.project_id, self.project_name, text.strip()))
             conn.commit()
             conn.close()
             self.load_data()
@@ -3119,16 +3120,66 @@ class DashboardV2(QMainWindow):
         
         if rules:
             # 获取未分配的文件
-            unassigned = conn.execute("SELECT DISTINCT file_path FROM activity_log WHERE file_path NOT IN (SELECT file_path FROM file_assignment)").fetchall()
+            unassigned = conn.execute("""
+                SELECT DISTINCT file_path, app_name 
+                FROM activity_log 
+                WHERE file_path NOT IN (SELECT file_path FROM file_assignment)
+            """).fetchall()
             
-            for (fpath,) in unassigned:
+            for fpath, app_name in unassigned:
                 if not fpath: continue
                 
                 # 检查每个规则
                 for pid, rule in rules:
-                    if rule and rule in fpath:
-                        conn.execute("INSERT OR IGNORE INTO file_assignment (file_path, project_id, assigned_at) VALUES (?, ?, ?)", 
-                                     (fpath, pid, datetime.now().isoformat()))
+                    if not rule: continue
+                    
+                    matched = False
+                    
+                    # 检查规则类型前缀
+                    if rule.startswith('app:'):
+                        # 应用名匹配
+                        pattern = rule[4:]  # 去掉 'app:' 前缀
+                        if app_name and pattern in app_name:
+                            matched = True
+                    elif rule.startswith('path:'):
+                        # 文件路径匹配
+                        pattern = rule[5:]  # 去掉 'path:' 前缀
+                        if pattern in fpath or (app_name and pattern in app_name):
+                            matched = True
+                    elif rule.startswith('folder:'):
+                        # 文件夹匹配
+                        pattern = rule[7:]  # 去掉 'folder:' 前缀
+                        if pattern in fpath:
+                            matched = True
+                    elif rule.startswith('combo:'):
+                        # 组合匹配：格式为 "combo:app:Trae,file:FocusFlow"
+                        pattern = rule[6:]  # 去掉 'combo:' 前缀
+                        parts = pattern.split(',')
+                        all_match = True
+                        for part in parts:
+                            if ':' in part:
+                                type_part, sub_pattern = part.split(':', 1)
+                                if type_part == 'app' and (not app_name or sub_pattern not in app_name):
+                                    all_match = False
+                                    break
+                                elif type_part == 'file' and sub_pattern not in fpath:
+                                    all_match = False
+                                    break
+                                elif type_part == 'path' and (sub_pattern not in fpath and (not app_name or sub_pattern not in app_name)):
+                                    all_match = False
+                                    break
+                        if all_match:
+                            matched = True
+                    else:
+                        # 默认：文件名匹配（无前缀，保持兼容性）
+                        if rule in fpath:
+                            matched = True
+                    
+                    if matched:
+                        conn.execute(
+                            "INSERT OR IGNORE INTO file_assignment (file_path, project_id, assigned_at) VALUES (?, ?, ?)", 
+                            (fpath, pid, datetime.now().isoformat())
+                        )
                         break
         
         conn.commit()
@@ -4328,7 +4379,7 @@ class DashboardV2(QMainWindow):
         # 创建对话框
         dlg = QDialog(self)
         dlg.setWindowTitle("智能提取规则 - 添加到项目")
-        dlg.setMinimumSize(800, 600)
+        dlg.setMinimumSize(900, 700)
         
         layout = QVBoxLayout(dlg)
         
@@ -4337,15 +4388,42 @@ class DashboardV2(QMainWindow):
         info_label.setStyleSheet("color: #666; padding: 10px;")
         layout.addWidget(info_label)
         
+        # 规则类型选择
+        type_group = QGroupBox("规则类型")
+        type_layout = QHBoxLayout()
+        
+        type_layout.addWidget(QLabel("匹配方式："))
+        self.rule_type_combo = QComboBox()
+        self.rule_type_combo.addItems([
+            "文件名匹配 (关键词在文件名中)",
+            "应用名匹配 (关键词在程序名中)", 
+            "文件路径匹配 (关键词在完整路径中)",
+            "文件夹匹配 (匹配整个文件夹)",
+            "组合匹配 (同时匹配多个条件)"
+        ])
+        type_layout.addWidget(self.rule_type_combo)
+        type_group.setLayout(type_layout)
+        layout.addWidget(type_group)
+        
         # 规则选择
-        rule_group = QGroupBox("候选规则（点击选择）")
+        rule_group = QGroupBox("候选规则（点击选择，可多选）")
         rule_layout = QVBoxLayout()
         
         self.rule_list = QListWidget()
+        self.rule_list.setSelectionMode(QAbstractItemView.MultiSelection)
         for rule in sorted(candidate_rules):
             item = QListWidgetItem(rule)
             self.rule_list.addItem(item)
         rule_layout.addWidget(self.rule_list)
+        
+        # 自定义规则输入
+        custom_layout = QHBoxLayout()
+        custom_layout.addWidget(QLabel("或输入自定义规则："))
+        self.custom_rule_input = QLineEdit()
+        self.custom_rule_input.setPlaceholderText("输入自定义匹配关键词...")
+        custom_layout.addWidget(self.custom_rule_input)
+        rule_layout.addLayout(custom_layout)
+        
         rule_group.setLayout(rule_layout)
         layout.addWidget(rule_group)
         
@@ -4362,7 +4440,7 @@ class DashboardV2(QMainWindow):
         layout.addWidget(preview_group)
         
         # 目标项目选择
-        project_group = QGroupBox("添加到项目（将保存到该项目的自动分配规则中）")
+        project_group = QGroupBox("添加到项目")
         project_layout = QVBoxLayout()
         
         self.project_combo = QComboBox()
@@ -4371,7 +4449,8 @@ class DashboardV2(QMainWindow):
         projects_data = get_projects_with_subprojects(show_archived)
         for project_key, project_name in projects_data:
             if project_key != '未分配':
-                project_id = int(project_key.replace('project_', ''))
+                # 正确解析 project_id：对于 'project_1.sub_1' 这样的格式，只取第一部分
+                project_id = int(project_key.split('.')[0].replace('project_', ''))
                 self.project_combo.addItem(project_name, project_id)
         project_layout.addWidget(self.project_combo)
         project_group.setLayout(project_layout)
@@ -4384,7 +4463,9 @@ class DashboardV2(QMainWindow):
         layout.addWidget(btn_box)
         
         # 连接信号
-        self.rule_list.itemClicked.connect(self.update_preview)
+        self.rule_list.itemSelectionChanged.connect(self.update_preview_for_project_map)
+        self.rule_type_combo.currentIndexChanged.connect(self.update_preview_for_project_map)
+        self.custom_rule_input.textChanged.connect(self.update_preview_for_project_map)
         
         # 初始化预览
         if self.rule_list.count() > 0:
@@ -4394,23 +4475,55 @@ class DashboardV2(QMainWindow):
         if dlg.exec() == QDialog.Accepted:
             # 获取选中的规则
             selected_items = self.rule_list.selectedItems()
-            if not selected_items:
-                return QMessageBox.warning(self, "提示", "请选择一个规则。")
+            custom_rule = self.custom_rule_input.text().strip()
             
-            rule_pattern = selected_items[0].text()
+            rules_to_add = []
+            
+            # 添加选中的规则
+            for item in selected_items:
+                rules_to_add.append(item.text())
+            
+            # 添加自定义规则
+            if custom_rule:
+                rules_to_add.append(custom_rule)
+            
+            if not rules_to_add:
+                return QMessageBox.warning(self, "提示", "请选择或输入至少一个规则。")
+            
             project_id = self.project_combo.currentData()
             project_name = self.project_combo.currentText()
+            rule_type_index = self.rule_type_combo.currentIndex()
             
-            # 保存规则到 project_map 表（项目的自动分配规则）
+            # 根据规则类型添加前缀
+            type_prefixes = ["", "app:", "path:", "folder:", "combo:"]
+            type_prefix = type_prefixes[rule_type_index]
+            
+            # 保存规则到 project_map 表
             conn = get_connection()
-            conn.execute("INSERT INTO project_map (project_id, rule_path) VALUES (?, ?)", 
-                        (project_id, rule_pattern))
+            added_count = 0
+            for rule_pattern in rules_to_add:
+                # 添加类型前缀（文件名匹配不需要前缀，保持兼容性）
+                full_rule = f"{type_prefix}{rule_pattern}" if type_prefix else rule_pattern
+                
+                # 检查规则是否已存在
+                existing = conn.execute(
+                    "SELECT id FROM project_map WHERE project_id = ? AND rule_path = ?",
+                    (project_id, full_rule)
+                ).fetchone()
+                
+                if not existing:
+                    conn.execute(
+                        "INSERT INTO project_map (project_id, project_name, rule_path) VALUES (?, ?, ?)",
+                        (project_id, project_name, full_rule)
+                    )
+                    added_count += 1
+            
             conn.commit()
             conn.close()
             
             QMessageBox.information(self, "完成", 
-                f"规则 '{rule_pattern}' 已添加到项目 '{project_name}' 的自动分配规则中。\n\n"
-                f"匹配此规则的文件将自动分配到该项目。")
+                f"已添加 {added_count} 条规则到项目 '{project_name}' 的自动分配规则中。\n\n"
+                f"匹配这些规则的文件将自动分配到该项目。")
             self.refresh_data()
     
     # 【新增】更新规则预览（用于 project_map 规则）
@@ -4421,43 +4534,99 @@ class DashboardV2(QMainWindow):
         
         # 获取选中的规则
         selected_items = self.rule_list.selectedItems()
-        if not selected_items:
+        custom_rule = self.custom_rule_input.text().strip() if hasattr(self, 'custom_rule_input') else ""
+        
+        # 收集所有规则
+        rules = []
+        for item in selected_items:
+            rules.append(item.text())
+        if custom_rule:
+            rules.append(custom_rule)
+        
+        if not rules:
             return
         
-        rule_pattern = selected_items[0].text()
+        # 获取规则类型
+        rule_type_index = self.rule_type_combo.currentIndex() if hasattr(self, 'rule_type_combo') else 0
         
-        # 从数据库获取匹配的文件（project_map 使用简单的路径匹配）
         conn = get_connection()
         cursor = conn.cursor()
         
-        # 查询匹配的文件 - project_map 规则是简单的路径包含匹配
-        cursor.execute("""
-            SELECT DISTINCT file_path, app_name, MAX(timestamp) as last_seen
-            FROM activity_log
-            WHERE file_path LIKE ? OR app_name LIKE ?
-            GROUP BY file_path, app_name
-            ORDER BY last_seen DESC
-            LIMIT 10
-        """, (f"%{rule_pattern}%", f"%{rule_pattern}%"))
+        # 根据规则类型构建查询
+        for rule_pattern in rules[:3]:  # 只预览前3个规则
+            if rule_type_index == 0:  # 文件名匹配
+                cursor.execute("""
+                    SELECT DISTINCT file_path, app_name, MAX(timestamp) as last_seen
+                    FROM activity_log
+                    WHERE file_path LIKE ?
+                    GROUP BY file_path, app_name
+                    ORDER BY last_seen DESC
+                    LIMIT 5
+                """, (f"%{rule_pattern}%",))
+            elif rule_type_index == 1:  # 应用名匹配
+                cursor.execute("""
+                    SELECT DISTINCT file_path, app_name, MAX(timestamp) as last_seen
+                    FROM activity_log
+                    WHERE app_name LIKE ?
+                    GROUP BY file_path, app_name
+                    ORDER BY last_seen DESC
+                    LIMIT 5
+                """, (f"%{rule_pattern}%",))
+            elif rule_type_index == 2:  # 文件路径匹配
+                cursor.execute("""
+                    SELECT DISTINCT file_path, app_name, MAX(timestamp) as last_seen
+                    FROM activity_log
+                    WHERE file_path LIKE ? OR app_name LIKE ?
+                    GROUP BY file_path, app_name
+                    ORDER BY last_seen DESC
+                    LIMIT 5
+                """, (f"%{rule_pattern}%", f"%{rule_pattern}%"))
+            elif rule_type_index == 3:  # 文件夹匹配
+                cursor.execute("""
+                    SELECT DISTINCT file_path, app_name, MAX(timestamp) as last_seen
+                    FROM activity_log
+                    WHERE file_path LIKE ?
+                    GROUP BY file_path, app_name
+                    ORDER BY last_seen DESC
+                    LIMIT 5
+                """, (f"%{rule_pattern}%",))
+            else:  # 组合匹配
+                cursor.execute("""
+                    SELECT DISTINCT file_path, app_name, MAX(timestamp) as last_seen
+                    FROM activity_log
+                    WHERE file_path LIKE ? OR app_name LIKE ?
+                    GROUP BY file_path, app_name
+                    ORDER BY last_seen DESC
+                    LIMIT 5
+                """, (f"%{rule_pattern}%", f"%{rule_pattern}%"))
+            
+            rows = cursor.fetchall()
+            
+            # 填充预览表
+            for row_data in rows:
+                file_path, app_name, last_seen = row_data
+                # 检查是否已存在
+                exists = False
+                for i in range(self.preview_table.rowCount()):
+                    if self.preview_table.item(i, 0).text() == file_path:
+                        exists = True
+                        break
+                
+                if not exists:
+                    row = self.preview_table.rowCount()
+                    self.preview_table.insertRow(row)
+                    
+                    self.preview_table.setItem(row, 0, QTableWidgetItem(file_path))
+                    self.preview_table.setItem(row, 1, QTableWidgetItem(app_name))
+                    
+                    # 格式化时间
+                    try:
+                        time_str = datetime.fromisoformat(last_seen.split('.')[0]).strftime("%Y-%m-%d %H:%M:%S")
+                    except:
+                        time_str = last_seen
+                    self.preview_table.setItem(row, 2, QTableWidgetItem(time_str))
         
-        rows = cursor.fetchall()
         conn.close()
-        
-        # 填充预览表
-        for row_data in rows:
-            file_path, app_name, last_seen = row_data
-            row = self.preview_table.rowCount()
-            self.preview_table.insertRow(row)
-            
-            self.preview_table.setItem(row, 0, QTableWidgetItem(file_path))
-            self.preview_table.setItem(row, 1, QTableWidgetItem(app_name))
-            
-            # 格式化时间
-            try:
-                time_str = datetime.fromisoformat(last_seen.split('.')[0]).strftime("%Y-%m-%d %H:%M:%S")
-            except:
-                time_str = last_seen
-            self.preview_table.setItem(row, 2, QTableWidgetItem(time_str))
     
     # 【新增】更新规则预览（旧方法，保留用于其他功能）
     def update_preview(self):
